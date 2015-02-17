@@ -22,6 +22,7 @@ class Task(BaseTask):
                  cache_timeout=None, delay=0,
                  raw=False, callback=None,
                  fallback_name=None,
+                 error_callback=None,
                  **kwargs):
         """
         Create `Task` object.
@@ -84,6 +85,8 @@ class Task(BaseTask):
                 raised if such 'task_*' handler does not exist.
             :param fallback_name: the name of method that is called when spider
                 gives up to do the task (due to multiple network errors)
+            :param error_callback: if request was failed then will execute
+                'error_callback' function.
 
             Any non-standard named arguments passed to `Task` constructor will
             be saved as attributes of the object. You can get their values
@@ -115,6 +118,10 @@ class Task(BaseTask):
         if grab is not None and grab_config is not None:
             raise SpiderMisuseError('Options grab and grab_config could not be '
                                     'used together')
+
+        if raw and error_callback is not None:
+            raise SpiderMisuseError('Options raw and error_callback could '
+                                    'not be used together')
 
         if grab:
             self.setup_grab_config(grab.dump_config())
