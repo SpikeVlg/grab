@@ -21,7 +21,7 @@ class Task(BaseTask):
                  valid_status=[], use_proxylist=True,
                  cache_timeout=None, delay=0,
                  raw=False, callback=None,
-                 fallback_name=None,
+                 error_callback=None,
                  **kwargs):
         """
         Create `Task` object.
@@ -82,7 +82,7 @@ class Task(BaseTask):
                 then the network response will be passed to this callback and
                 the usual 'task_*' handler will be ignored and no error will be
                 raised if such 'task_*' handler does not exist.
-            :param fallback_name: the name of method that is called when spider
+            :param error_callback: the callback method that is called when spider
                 gives up to do the task (due to multiple network errors)
 
             Any non-standard named arguments passed to `Task` constructor will
@@ -116,6 +116,10 @@ class Task(BaseTask):
             raise SpiderMisuseError(
                 'Options grab and grab_config could not be used together')
 
+        if raw and error_callback is not None:
+            raise SpiderMisuseError(
+                'Options raw and error_callback could not be used together')
+
         if grab:
             self.setup_grab_config(grab.dump_config())
         elif grab_config:
@@ -126,7 +130,7 @@ class Task(BaseTask):
 
         self.process_delay_option(delay)
 
-        self.fallback_name = fallback_name
+        self.error_callback = error_callback
         self.priority_is_custom = priority_is_custom
         self.priority = priority
         self.network_try_count = network_try_count

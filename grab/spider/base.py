@@ -326,23 +326,18 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
         """
         Check that network/try counters are OK.
 
-        Returns:
-        * if success: (True, None)
-        * if error: (False, reason)
-
+        if error raise StopTaskProcessing exception
         """
 
         if task.task_try_count > self.task_try_limit:
             logger.debug('Task tries (%d) ended: %s / %s' % (
                           self.task_try_limit, task.name, task.url))
-            return False, 'task-try-count'
+            raise StopTaskProcessing('task-try-count')
 
         if task.network_try_count > self.network_try_limit:
             logger.debug('Network tries (%d) ended: %s / %s' % (
                           self.network_try_limit, task.name, task.url))
-            return False, 'network-try-count'
-
-        return True, None
+            raise StopTaskProcessing('network-try-count')
 
     def generate_task_priority(self):
         if self.priority_mode == 'const':
@@ -841,16 +836,10 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
                 with self.save_timer('network_transport'):
                     logger_verbose.debug('Submitting task to the transport '
                                          'layer')
-                    try:
-                        self.transport.process_task(task, grab,
-                                                    grab_config_backup)
-                    except GrabInvalidUrl:
-                        logger.debug('Task %s has invalid URL: %s' % (
-                            task.name, task.url))
-                        self.add_item('invalid-url', task.url)
-                    else:
-                        logger_verbose.debug('Asking transport layer to do '
-                                             'something')
+                    self.transport.process_task(task, grab,
+                                                grab_config_backup)
+                    logger_verbose.debug('Asking transport layer to do '
+                                         'something')
 
     def is_valid_for_cache(self, res):
         """
@@ -877,6 +866,42 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
 
         logger_verbose.debug('Method `stop` was called')
         self.work_allowed = False
+
+    def try_execute_new_task(self, task):
+        logger_verbose.debug('Got new task from task queue: %s' % task)
+        self.process_task_counters(task)
+
+        try:
+            self.check_task_limits(task)
+        except StopTaskProcessing as ex:
+            if str(ex) == 'task-try-count':
+                self.add_item('task-count-rejected', task.url)
+            elif str(ex) == 'network-try-count':
+                self.add_item('network-count-rejected', task.url)
+            else:
+                raise StopTaskProcessing('Unknown response from '
+                                         'check_task_limits: %s' % str(ex))
+
+            if task.error_callback is not None:
+                task.error_callback(self, task, ex)
+            return
+
+        try:
+            self.process_new_task(task)
+        except Exception as ex:
+            if isinstance(ex, GrabInvalidUrl):
+                logger.debug('Task %s has invalid URL: %s' % (
+                         task.name, task.url))
+                self.add_item('invalid-url', task.url)
+            else:
+                logger.debug('Task {name} got exception {ex} by url {url}'.format(
+                             name=task.name, url=task.url, ex=ex))
+            if task.error_callback is not None:
+                task.error_callback(self, task, ex)
+            else:
+                raise ex
+
+        self.transport.process_handlers()
 
     def run(self):
         """
@@ -998,40 +1023,8 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
                         if self.ng:
                             if self.waiting_shutdown_event.is_set():
                                 self.waiting_shutdown_event.clear()
-                        logger_verbose.debug('Got new task from task queue: %s'
-                                             % task)
-                        self.process_task_counters(task)
 
-                        is_valid, reason = self.check_task_limits(task)
-                        if not is_valid:
-                            logger_verbose.debug('Task %s is rejected due to '
-                                                 '%s limit'
-                                                 % (task.name, reason))
-                            if reason == 'task-try-count':
-                                self.add_item('task-count-rejected', task.url)
-                            elif reason == 'network-try-count':
-                                self.add_item('network-count-rejected',
-                                              task.url)
-                            else:
-                                raise Exception('Unknown response from '
-                                                'check_task_limits: %s'
-                                                % reason)
-                            handler = task.get_fallback_handler(self)
-                            if handler:
-                                handler(task, StopTaskProcessing(reason))
-                            # TODO: not do following line
-                            # TODO: middleware: TaskFails
-                        else:
-                            try:
-                                self.process_new_task(task)
-                                self.transport.process_handlers()
-                            except Exception as ex:
-                                logger.debug('Got exception {ex}'.format(ex=ex))
-                                handler = task.get_fallback_handler(self)
-                                if handler:
-                                    handler(task, ex)
-                                else:
-                                    raise
+                        self.try_execute_new_task(task)
 
                 with self.save_timer('network_transport'):
                     logger_verbose.debug('Asking transport layer to do '
