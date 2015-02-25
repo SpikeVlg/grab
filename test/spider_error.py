@@ -1,7 +1,9 @@
 from grab.spider import Spider, Task
 import logging
 
-from test.util import BaseGrabTestCase
+#from test.util import BaseGrabTestCase
+from util import BaseGrabTestCase
+from tools.error import InvalidUrlError
 
 # That URLs breaks Grab's URL normalization process
 # with error "label empty or too long"
@@ -15,7 +17,7 @@ INVALID_URL = 'http://13354&altProductId=6423589&productId=6423589'\
 class SpiderErrorTestCase(BaseGrabTestCase):
     def setUp(self):
         self.server.reset()
-
+    """
     def test_generator_with_invalid_url(self):
 
         class SomeSpider(Spider):
@@ -47,19 +49,27 @@ class SpiderErrorTestCase(BaseGrabTestCase):
         ]
         bot = SomeSpider(network_try_limit=1)
         bot.run()
+    """
 
     def test_call_fallback_method_exist(self):
-
+        class GrabInvalidUrl(Exception): pass
         class SomeSpider(Spider):
             def prepare(self):
                 self.fallback_called = False
                 self.exception = None
 
-            def task_generator(self):
-                yield Task('page', url=INVALID_URL, fallback_name='fallback_method')
+            def error_callback(spider, task, ex):
+                print('==========')
+                print(type(ex))
+                spider.fallback_called = True
+                spider.exception = ex
 
-            def process_new_task(self, task):
-                raise GrabInvalidUrl("SomeException")
+            def task_generator(self):
+                #yield Task('page', url=INVALID_URL, error_callback=SomeSpider.error_callback)
+                yield Task('page', url=INVALID_URL)
+
+            #def process_new_task(self, task):
+            #    raise GrabInvalidUrl("SomeException")
 
             def fallback_method(self, task, exception):
                 self.fallback_called = True
@@ -71,4 +81,9 @@ class SpiderErrorTestCase(BaseGrabTestCase):
         bot = SomeSpider()
         bot.run()
         self.assertEqual(bot.fallback_called, True)
-        self.assertTrue(isinstance(bot.exception, GrabInvalidUrl))
+        self.assertTrue(isinstance(bot.exception, InvalidUrlError))
+
+
+import unittest
+if __name__ == '__main__':
+    unittest.main()
