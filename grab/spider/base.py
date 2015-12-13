@@ -1,10 +1,7 @@
 from __future__ import absolute_import
 import types
-import signal
 import logging
-from collections import defaultdict
 import time
-import json
 try:
     from urlparse import urljoin
 except ImportError:
@@ -15,24 +12,36 @@ try:
 except ImportError:
     import queue
 from copy import deepcopy
+import six
+import os
+from weblib import metric
+from contextlib import contextmanager
+from traceback import format_exc
+import multiprocessing
+import threading
+from datetime import datetime
 
 from grab.base import Grab
 from grab.error import GrabInvalidUrl
 from grab.spider.error import (SpiderError, SpiderMisuseError, FatalError,
-                               StopTaskProcessing, NoTaskHandler, NoDataHandler)
-from grab.spider.task import Task, NullTask
+                               NoTaskHandler, NoDataHandler,
+                               SpiderConfigurationError)
+from grab.spider.task import Task
 from grab.spider.data import Data
-from grab.spider.pattern import SpiderPattern
-from grab.spider.stat  import SpiderStat
 from grab.spider.transport.multicurl import MulticurlTransport
-from grab.proxylist import ProxyList
-from grab.spider.command_controller import CommandController
+from grab.proxylist import ProxyList, BaseProxySource
 from grab.util.misc import camel_case_to_underscore
-from grab.util.py2old_support import * # noqa
-from grab.util.py3k_support import * # noqa
-from tools.encoding import make_str, make_unicode
+from weblib.encoding import make_str, make_unicode
+from grab.base import GLOBAL_STATE
+from grab.stat import Stat, Timer
+from grab.spider.parser_pipeline import ParserPipeline
+from grab.spider.deprecated import DeprecatedThingsSpiderMixin
+from grab.util.warning import warn
 
 DEFAULT_TASK_PRIORITY = 100
+DEFAULT_NETWORK_STREAM_NUMBER = 3
+DEFAULT_TASK_TRY_LIMIT = 3
+DEFAULT_NETWORK_TRY_LIMIT = 3
 RANDOM_TASK_PRIORITY_RANGE = (50, 100)
 NULL = object()
 
@@ -46,15 +55,16 @@ logger_verbose.setLevel(logging.FATAL)
 class SpiderMetaClass(type):
     """
     This meta class does following things::
-    
-    * It creates Meta attribute if it does not defined in Spider descendant class by
-        copying parent's Meta attribute
+
+    * It creates Meta attribute, if it is not defined in
+        Spider descendant class, by copying parent's Meta attribute
     * It reset Meta.abstract to False if Meta is copied from parent class
-    * If defined Meta does not contains `abstract` attribute then define it and set to False
+    * If defined Meta does not contains `abstract`
+        attribute then define it and set to False
     """
 
     def __new__(cls, name, bases, namespace):
-        if not 'Meta' in namespace:
+        if 'Meta' not in namespace:
             for base in bases:
                 if hasattr(base, 'Meta'):
                     # copy contents of base Meta
@@ -65,7 +75,7 @@ class SpiderMetaClass(type):
                     break
 
         # Process special case (SpiderMetaClassMixin)
-        if not 'Meta' in namespace:
+        if 'Meta' not in namespace:
             namespace['Meta'] = type('Meta', (object,), {})
 
         if not hasattr(namespace['Meta'], 'abstract'):
@@ -74,11 +84,8 @@ class SpiderMetaClass(type):
         return super(SpiderMetaClass, cls).__new__(cls, name, bases, namespace)
 
 
-# See http://mikewatkins.ca/2008/11/29/python-2-and-3-metaclasses/
-SpiderMetaClassMixin = SpiderMetaClass('SpiderMetaClassMixin', (object,), {})
-
-
-class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
+@six.add_metaclass(SpiderMetaClass)
+class Spider(DeprecatedThingsSpiderMixin):
     """
     Asynchronous scraping framework.
     """
@@ -91,15 +98,6 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
     # `initial_urls` attribute
     initial_urls = None
 
-    # The base url which is used to resolve all relative urls
-    # The resolving takes place in `add_task` method
-    base_url = None
-
-    middlewares = []
-    middleware_points = {
-        'response': [],
-    }
-
     class Meta:
         # Meta.abstract means that this class will not be
         # collected to spider registry by `grab crawl` CLI command.
@@ -107,24 +105,48 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
         # Meta.abstract is reset to False in each descendant
         abstract = True
 
-    def __init__(self, thread_number=3,
-                 network_try_limit=10, task_try_limit=10,
+    # *************
+    # Class Methods
+    # *************
+
+    @classmethod
+    def setup_spider_config(cls, config):
+        pass
+
+    @classmethod
+    def get_spider_name(cls):
+        if hasattr(cls, 'spider_name'):
+            return cls.spider_name
+        else:
+            return camel_case_to_underscore(cls.__name__)
+
+    # **************
+    # Public Methods
+    # **************
+
+    def __init__(self, thread_number=None,
+                 network_try_limit=None, task_try_limit=None,
                  request_pause=NULL,
                  priority_mode='random',
                  meta=None,
                  only_cache=False,
                  config=None,
-                 slave=False,
+                 slave=None,
                  max_task_generator_chunk=None,
                  args=None,
                  # New options start here
-                 waiting_shutdown_event=None,
                  taskq=None,
-                 result_queue=None,
-                 network_response_queue=None,
+                 # MP:
+                 network_result_queue=None,
+                 parser_result_queue=None,
+                 waiting_shutdown_event=None,
                  shutdown_event=None,
-                 generator_done_event=None,
-                 ng=False,
+                 mp_mode=False,
+                 parser_pool_size=None,
+                 parser_mode=False,
+                 parser_requests_per_process=10000,
+                 # http api
+                 http_api_port=None,
                  ):
         """
         Arguments:
@@ -144,45 +166,60 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
             network request which is performed again due to network error
         * args - command line arguments parsed with `setup_arg_parser` method
         New options:
-        * waiting_shutdown_event=None,
         * taskq=None,
-        * result_queue=None,
         * newtork_response_queue=None,
-        * shutdown_event=None,
-        * generator_done_event=None):
         """
 
-        # New options starts
+        if slave is not None:
+            raise SpiderConfigurtionError(
+                'Slave mode is not supported anymore. '
+                'Use `mp_mode=True` option to run multiple HTML'
+                ' parser processes.')
+
+        # API:
+        self.http_api_port = http_api_port
+
+        # MP:
+        self.mp_mode = mp_mode
+        if self.mp_mode:
+            from multiprocessing import Process, Event, Queue
+        else:
+            from multiprocessing.dummy import Process, Event, Queue
+
+        if network_result_queue is not None:
+            self.network_result_queue = network_result_queue
+        else:
+            self.network_result_queue = Queue()
+        self.parser_result_queue = parser_result_queue
         self.waiting_shutdown_event = waiting_shutdown_event
-        self.taskq = taskq
-        self.result_queue = result_queue
-        self.shutdown_event = shutdown_event
-        self.generator_done_event = generator_done_event
-        self.network_response_queue = network_response_queue
-        self.ng = ng
-        # New options ends
+        if shutdown_event is not None:
+            self.shutdown_event = shutdown_event
+        else:
+            self.shutdown_event = Event()
+        if not self.mp_mode and parser_pool_size and parser_pool_size > 1:
+            raise SpiderConfigurationError(
+                'Parser pool size could be only 1 in '
+                'non-multiprocess mode')
+        self.parser_pool_size = parser_pool_size
+        self.parser_mode = parser_mode
+        self.parser_requests_per_process = parser_requests_per_process
+
+        self.stat = Stat()
+        self.timer = Timer()
+        self.task_queue = taskq
 
         if args is None:
             self.args = {}
         else:
             self.args = args
 
-        self.slave = slave
 
         self.max_task_generator_chunk = max_task_generator_chunk
-        self.timers = {
-            'network-name-lookup': 0,
-            'network-connect': 0,
-            'network-total': 0,
-        }
-        self.time_points = {}
-        self.start_timer('total')
+        self.timer.start('total')
         if config is not None:
             self.config = config
         else:
-            # Fix circular import error
-            from grab.util.config import Config
-            self.config = Config()
+            self.config = {}
 
         if meta:
             self.meta = meta
@@ -191,27 +228,25 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
 
         self.task_generator_enabled = False
         self.only_cache = only_cache
-        self.thread_number = thread_number
-        self.counters = defaultdict(int)
+
+        self.thread_number = (
+            thread_number or
+            int(self.config.get('thread_number',
+                                DEFAULT_NETWORK_STREAM_NUMBER)))
+        self.task_try_limit = (
+            task_try_limit or
+            int(self.config.get('task_try_limit', DEFAULT_TASK_TRY_LIMIT)))
+        self.network_try_limit = (
+            network_try_limit or
+            int(self.config.get('network_try_limit',
+                                DEFAULT_NETWORK_TRY_LIMIT)))
+
         self._grab_config = {}
-        self.items = {}
-        self.task_try_limit = task_try_limit
-        self.network_try_limit = network_try_limit
         if priority_mode not in ['random', 'const']:
             raise SpiderMisuseError('Value of priority_mode option should be '
                                     '"random" or "const"')
         else:
             self.priority_mode = priority_mode
-
-        try:
-            signal.signal(signal.SIGUSR1, self.sigusr1_handler)
-        except (ValueError, AttributeError):
-            pass
-
-        try:
-            signal.signal(signal.SIGUSR2, self.sigusr2_handler)
-        except (ValueError, AttributeError):
-            pass
 
         # Initial cache-subsystem values
         self.cache_enabled = False
@@ -219,58 +254,14 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
 
         self.work_allowed = True
         if request_pause is not NULL:
-            logger.error('Option `request_pause` is deprecated and is not '
-                         'supported anymore')
+            warn('Option `request_pause` is deprecated and is not '
+                 'supported anymore')
 
         self.proxylist_enabled = None
         self.proxylist = None
         self.proxy = None
         self.proxy_auto_change = False
-
-        # FIXIT: REMOVE
-        self.dump_spider_stats = None
-
-        self.controller = CommandController(self)
-
-        # snapshots contains information about spider's state
-        # for each 10 seconds interval
-        self.snapshots = {}
-        self.last_snapshot_values = {
-            'timestamp': 0,
-            'download-size': 0,
-            'upload-size': 0,
-            'download-size-with-cache': 0,
-            'request-count': 0,
-        }
-        self.snapshot_timestamps = []
-        self.snapshot_interval = self.config.get('GRAB_SNAPSHOT_CONFIG', {}).get('interval', 10)
-        self.snapshot_file = self.config.get('GRAB_SNAPSHOT_CONFIG', {}).get('file', None)
-        if self.snapshot_file:
-            open(self.snapshot_file, 'w').write('')
-
         self.interrupted = False
-
-    def get_grab_config(self):
-        logger.error('Using `grab_config` attribute is deprecated. Override '
-                     '`create_grab_instance method instead.')
-        return self._grab_config
-
-    def set_grab_config(self, val):
-        logger.error('Using `grab_config` attribute is deprecated. Override '
-                     '`create_grab_instance method instead.')
-        self._grab_config = val
-
-    grab_config = property(get_grab_config, set_grab_config)
-
-    def setup_middleware(self, middleware_list):
-        for item in middleware_list:
-            self.middlewares.append(item)
-            mod_path, cls_name = item.rsplit('.', 1)
-            mod = __import__(mod_path, None, None, ['foo'])
-            cls = getattr(mod, cls_name)
-            mid = cls()
-            if hasattr(mid, 'process_response'):
-                self.middleware_points['response'].append(mid)
 
     def setup_cache(self, backend='mongo', database=None, use_compression=True,
                     **kwargs):
@@ -288,8 +279,172 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
         logger.debug('Using %s backend for task queue' % backend)
         mod = __import__('grab.spider.queue_backend.%s' % backend,
                          globals(), locals(), ['foo'])
-        self.taskq = mod.QueueBackend(spider_name=self.get_name(),
-                                      **kwargs)
+        self.task_queue = mod.QueueBackend(spider_name=self.get_spider_name(),
+                                           **kwargs)
+
+    def add_task(self, task, raise_error=False):
+        """
+        Add task to the task queue.
+        """
+
+        # MP:
+        # ***
+        if self.parser_mode:
+            self.parser_result_queue.put((task, None))
+            return
+
+        if self.task_queue is None:
+            raise SpiderMisuseError('You should configure task queue before '
+                                    'adding tasks. Use `setup_queue` method.')
+        if task.priority is None or not task.priority_is_custom:
+            task.priority = self.generate_task_priority()
+            task.priority_is_custom = False
+        else:
+            task.priority_is_custom = True
+
+        try:
+            if not task.url.startswith(('http://', 'https://', 'ftp://',
+                                        'file://', 'feed://')):
+                if self.base_url is None:
+                    msg = 'Could not resolve relative URL because base_url ' \
+                          'is not specified. Task: %s, URL: %s'\
+                          % (task.name, task.url)
+                    raise SpiderError(msg)
+                else:
+                    warn('Class attribute `Spider::base_url` is deprecated. '
+                         'Use Task objects with absolute URLs')
+                    task.url = urljoin(self.base_url, task.url)
+                    # If task has grab_config object then update it too
+                    if task.grab_config:
+                        task.grab_config['url'] = task.url
+        except Exception as ex:
+            self.stat.collect('task-with-invalid-url', task.url)
+            if raise_error:
+                raise
+            else:
+                logger.error('', exc_info=ex)
+                return False
+
+        # TODO: keep original task priority if it was set explicitly
+        self.task_queue.put(task, task.priority, schedule_time=task.schedule_time)
+        return True
+
+    def stop(self):
+        """
+        This method set internal flag which signal spider
+        to stop processing new task and shuts down.
+        """
+
+        logger_verbose.debug('Method `stop` was called')
+        self.work_allowed = False
+
+    def load_proxylist(self, source, source_type=None, proxy_type='http',
+                       auto_init=True, auto_change=True,
+                       **kwargs):
+        self.proxylist = ProxyList()
+        if isinstance(source, BaseProxySource):
+            self.proxylist.set_source(source)
+        elif isinstance(source, six.string_types):
+            if source_type == 'text_file':
+                self.proxylist.load_file(source, proxy_type=proxy_type)
+            elif source_type == 'url':
+                self.proxylist.load_url(source, proxy_type=proxy_type)
+            else:
+                raise SpiderMisuseError('Method `load_proxylist` received '
+                                        'invalid `source_type` argument: %s'
+                                        % source_type) 
+        else:
+            raise SpiderMisuseError('Method `load_proxylist` received '
+                                    'invalid `source` argument: %s'
+                                    % source) 
+
+        self.proxylist_enabled = True
+        self.proxy = None
+        if not auto_change and auto_init:
+            self.proxy = self.proxylist.get_random_proxy()
+        self.proxy_auto_change = auto_change
+
+    def process_next_page(self, grab, task, xpath,
+                          resolve_base=False, **kwargs):
+        """
+        Generate task for next page.
+
+        :param grab: Grab instance
+        :param task: Task object which should be assigned to next page url
+        :param xpath: xpath expression which calculates list of URLS
+        :param **kwargs: extra settings for new task object
+
+        Example::
+
+            self.follow_links(grab, 'topic', '//div[@class="topic"]/a/@href')
+        """
+        try:
+            # next_url = grab.xpath_text(xpath)
+            next_url = grab.doc.select(xpath).text()
+        except IndexError:
+            return False
+        else:
+            url = grab.make_url_absolute(next_url, resolve_base=resolve_base)
+            page = task.get('page', 1) + 1
+            grab2 = grab.clone()
+            grab2.setup(url=url)
+            task2 = task.clone(task_try_count=1, grab=grab2,
+                               page=page, **kwargs)
+            self.add_task(task2)
+            return True
+
+    def render_stats(self, timing=True):
+        out = ['------------ Stats: ------------']
+        out.append('Counters:')
+
+        # Process counters
+        items = sorted(self.stat.counters.items(),
+                       key=lambda x: x[0], reverse=True)
+        for item in items:
+            out.append('  %s: %s' % item)
+        out.append('')
+
+        out.append('Lists:')
+        # Process collections sorted by size desc
+        col_sizes = [(x, len(y)) for x, y in self.stat.collections.items()]
+        col_sizes = sorted(col_sizes, key=lambda x: x[1], reverse=True)
+        for col_size in col_sizes:
+            out.append('  %s: %d' % col_size)
+        out.append('')
+
+        # Process extra metrics
+        if 'download-size' in self.stat.counters:
+            out.append('Network download: %s' %
+                       metric.format_traffic_value(
+                           self.stat.counters['download-size']))
+        out.append('Queue size: %d' % self.task_queue.size()
+                                      if self.task_queue else 'NA')
+        out.append('Network streams: %d' % self.thread_number)
+        elapsed = self.timer.timers['total']
+        hours, seconds = divmod(elapsed, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        out.append('Time elapsed: %d:%d:%d (H:M:S)' % (
+            hours, minutes, seconds))
+        out.append('End time: %s' % 
+                   datetime.utcnow().strftime('%d %b %Y, %H:%M:%S UTC'))
+
+        if timing:
+            out.append('')
+            out.append(self.render_timing())
+        return '\n'.join(out) + '\n'
+
+    def render_timing(self):
+        out = ['Timers:']
+        out.append('  DOM: %.3f' % GLOBAL_STATE['dom_build_time'])
+        time_items = [(x, y) for x, y in self.timer.timers.items()]
+        time_items = sorted(time_items, key=lambda x: x[1])
+        for time_item in time_items:
+            out.append('  %s: %.03f' % time_item)
+        return '\n'.join(out) + '\n'
+
+    # ********************************
+    # Methods for spider customization
+    # ********************************
 
     def prepare(self):
         """
@@ -298,31 +453,68 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
         this method in your Spider class.
         """
 
-    def sigusr1_handler(self, signal, frame):
+
+    def prepare_parser(self):
         """
-        Catches SIGUSR1 signal and dumps current state
-        to temporary file
+        You can do additional spider customization here
+        before it has started working. Simply redefine
+        this method in your Spider class.
+
+        This method is called only from Spider working in parser mode
+        that, in turn, is spawned automatically by main spider proces
+        working in multiprocess mode.
         """
 
-        with open('/tmp/spider.state', 'w') as out:
-            out.write(self.render_stats())
-
-    def sigusr2_handler(self, signal, frame):
+    def shutdown(self):
         """
-        Catches SIGUSR1 signal and shutdowns spider.
+        You can override this method to do some final actions
+        after parsing has been done.
         """
-        
-        logger.error('Received SIGUSR2 signal. Doing shutdown')
-        self.stop()
 
-    def setup_grab(self, **kwargs):
-        logging.error('This method is deprecated. Instead override '
-                      '`create_grab_instance` method in you spider sub-class')
-        self.grab_config.update(**kwargs)
+        pass
+
+    def update_grab_instance(self, grab):
+        """
+        Use this method to automatically update config of any
+        `Grab` instance created by the spider.
+        """
+        pass
+
+    def create_grab_instance(self, **kwargs):
+        # Back-ward compatibility for deprecated `grab_config` attribute
+        # Here I use `_grab_config` to not trigger warning messages
+        if self._grab_config and kwargs:
+            merged_config = deepcopy(self._grab_config)
+            merged_config.update(kwargs)
+            grab = Grab(**merged_config)
+        elif self._grab_config and not kwargs:
+            grab = Grab(**self._grab_config)
+        else:
+            grab = Grab(**kwargs)
+        return grab
+
+    def task_generator(self):
+        """
+        You can override this method to load new tasks smoothly.
+
+        It will be used each time as number of tasks
+        in task queue is less then number of threads multiplied on 2
+        This allows you to not overload all free memory if total number of
+        tasks is big.
+        """
+
+        if False:
+            # Some magic to make this function empty generator
+            yield ':-)'
+        return
+
+    # ***************
+    # Private Methods
+    # ***************
 
     def check_task_limits(self, task):
         """
-        Check that network/try counters are OK.
+        Check that task's network & try counters do not exceed limits.
 
         Returns:
         * if success: (True, None)
@@ -331,13 +523,9 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
         """
 
         if task.task_try_count > self.task_try_limit:
-            logger.debug('Task tries (%d) ended: %s / %s' % (
-                          self.task_try_limit, task.name, task.url))
             return False, 'task-try-count'
 
         if task.network_try_count > self.network_try_limit:
-            logger.debug('Network tries (%d) ended: %s / %s' % (
-                          self.network_try_limit, task.name, task.url))
             return False, 'network-try-count'
 
         return True, None
@@ -348,68 +536,6 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
         else:
             return randint(*RANDOM_TASK_PRIORITY_RANGE)
 
-    def add_task(self, task):
-        """
-        Add task to the task queue.
-        """
-
-        if self.taskq is None:
-            raise SpiderMisuseError('You should configure task queue before '
-                                    'adding tasks. Use `setup_queue` method.')
-        if task.priority is None or not task.priority_is_custom:
-            task.priority = self.generate_task_priority()
-            task.priority_is_custom = False
-        else:
-            task.priority_is_custom = True
-
-        if not isinstance(task, NullTask):
-            if not task.url.startswith(('http://', 'https://', 'ftp://', 'file://', 'feed://')):
-                if self.base_url is None:
-                    msg = 'Could not resolve relative URL because base_url ' \
-                          'is not specified. Task: %s, URL: %s'\
-                          % (task.name, task.url)
-                    logger.error(msg)
-                    self.add_item('task-with-invalid-url', task.url)
-                    return False
-                else:
-                    task.url = urljoin(self.base_url, task.url)
-                    # If task has grab_config object then update it too
-                    if task.grab_config:
-                        task.grab_config['url'] = task.url
-
-        # TODO: keep original task priority if it was set explicitly
-        self.taskq.put(task, task.priority, schedule_time=task.schedule_time)
-        is_valid = True
-        return is_valid
-
-    def load_initial_urls(self):
-        """
-        Create initial tasks from `self.initial_urls`.
-
-        Tasks are created with name "initial".
-        """
-
-        if self.initial_urls:
-            for url in self.initial_urls:
-                self.add_task(Task('initial', url=url))
-
-    def setup_default_queue(self):
-        """
-        If task queue is not configured explicitly
-        then create task queue with default parameters
-
-        This method is not the same as `self.setup_queue` because
-        `self.setup_queue` works by default with in-memory queue.
-        You can override `setup_default_queue` in your custom
-        Spider and use other storage engines for you
-        default task queue.
-        """
-
-        # If queue is still not configured
-        # then configure it with default backend
-        if self.taskq is None:
-            self.setup_queue()
-        
     def process_task_generator(self):
         """
         Load new tasks from `self.task_generator_object`
@@ -420,25 +546,22 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
         """
 
         if self.task_generator_enabled:
-            if hasattr(self.taskq, 'qsize'):
-                qsize = self.taskq.qsize()
-            else:
-                qsize = self.taskq.size()
+            queue_size = self.task_queue.size()
             if self.max_task_generator_chunk is not None:
                 min_limit = min(self.max_task_generator_chunk,
                                 self.thread_number * 10)
             else:
                 min_limit = self.thread_number * 10
-            if qsize < min_limit:
-                logger_verbose.debug('Task queue contains less tasks (%d) than '
-                                     'allowed limit (%d). Trying to add '
-                                     'new tasks.' % (qsize, min_limit))
+            if queue_size < min_limit:
+                logger_verbose.debug(
+                    'Task queue contains less tasks (%d) than '
+                    'allowed limit (%d). Trying to add '
+                    'new tasks.' % (queue_size, min_limit))
                 try:
-                    for x in xrange(min_limit - qsize):
+                    for x in six.moves.range(min_limit - queue_size):
                         item = next(self.task_generator_object)
                         logger_verbose.debug('Got new item from generator. '
                                              'Processing it.')
-                        # self.add_task(item)
                         self.process_handler_result(item)
                 except StopIteration:
                     # If generator have no values to yield
@@ -447,81 +570,37 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
                                          'Disabling it')
                     self.task_generator_enabled = False
 
-    def init_task_generator(self):
+    def start_task_generator(self):
         """
-        Process `initial_urls` and `task_generator`.
-        Generate first portion of tasks.
+        Process `self.initial_urls` list and `self.task_generator`
+        method.  Generate first portion of tasks.
+        """
 
-        TODO: task generator should work in separate OS process
-        """
+        logger_verbose.debug('Processing initial urls')
+        if self.initial_urls:
+            for url in self.initial_urls:
+                self.add_task(Task('initial', url=url))
 
         self.task_generator_object = self.task_generator()
         self.task_generator_enabled = True
-
-        logger_verbose.debug('Processing initial urls')
-        self.load_initial_urls()
-
-        # Initial call to task generator
-        # before main cycle
+        # Initial call to task generator before spider has started working
         self.process_task_generator()
 
-    def load_new_task(self):
+    def get_task_from_queue(self):
         start = time.time()
-        while True:
-            try:
-                with self.save_timer('task_queue'):
-                    return self.taskq.get()
-            except queue.Empty:
-                qsize = self.taskq.size()
-                if qsize:
-                    logger_verbose.debug('No ready-to-go tasks, Waiting for scheduled tasks (%d)' % qsize)
-                    return True
-                if not self.slave:
-                    logger_verbose.debug('Task queue is empty.')
-                    return None
-                else:
-                    # Temporarily hack which force slave crawler
-                    # to wait 5 seconds for new tasks, this solves
-                    # the problem that sometimes slave crawler stop
-                    # its work because it could not receive new
-                    # tasks immediately
-                    if not self.transport.active_task_number():
-                        if time.time() - start < 5:
-                            time.sleep(0.1)
-                            logger.debug('Slave sleeping')
-                        else:
-                            break
-                    else:
-                        break
-
-        logger_verbose.debug('Task queue is empty.')
-        return None
-
-    def process_task_counters(self, task):
-        task.network_try_count += 1
-        if task.task_try_count == 0:
-            task.task_try_count = 1
-
-    def create_grab_instance(self, **kwargs):
-        # Back-ward compatibility for deprecated `grab_config` attribute
-        # Use _grab_config to not trigger warning messages
-        if self._grab_config and kwargs:
-            merged_config = deepcopy(self._grab_config)
-            merged_config.update(kwargs)
-            grab = Grab(**merged_config)
-        elif self._grab_config and not kwargs:
-            grab = Grab(**self._grab_config)
-        else:
-            grab = Grab(**kwargs)
-        self.update_grab_instance(grab)
-        return grab
-
-    def update_grab_instance(self, grab):
-        """
-        Use this method to automatically update config of any
-        `Grab` instance created by the spider.
-        """
-        pass
+        try:
+            with self.timer.log_time('task_queue'):
+                return self.task_queue.get()
+        except queue.Empty:
+            size = self.task_queue.size()
+            if size:
+                logger_verbose.debug(
+                    'No ready-to-go tasks, Waiting for '
+                    'scheduled tasks (%d)' % size)
+                return True
+            else:
+                logger_verbose.debug('Task queue is empty.')
+                return None
 
     def setup_grab_for_task(self, task):
         grab = self.create_grab_instance()
@@ -532,6 +611,7 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
 
         # Generate new common headers
         grab.config['common_headers'] = grab.common_headers()
+        self.update_grab_instance(grab)
         return grab
 
     def is_task_cacheable(self, task, grab):
@@ -547,26 +627,27 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
         else:
             return True
 
-    def load_task_from_cache(self, transport, task, grab, grab_config_backup):
-        cache_item = self.cache.get_item(grab.config['url'],
-                                         timeout=task.cache_timeout)
-        if cache_item is None:
-            return None
-        else:
-            with self.save_timer('cache.read.prepare_request'):
-                grab.prepare_request()
-            with self.save_timer('cache.read.load_response'):
-                self.cache.load_response(grab, cache_item)
+    def load_task_from_cache(self, task, grab, grab_config_backup):
+        with self.timer.log_time('cache'):
+            with self.timer.log_time('cache.read'):
+                cache_item = self.cache.get_item(
+                    grab.config['url'], timeout=task.cache_timeout)
+                if cache_item is None:
+                    return None
+                else:
+                    with self.timer.log_time('cache.read.prepare_request'):
+                        grab.prepare_request()
+                    with self.timer.log_time('cache.read.load_response'):
+                        self.cache.load_response(grab, cache_item)
 
-            grab.log_request('CACHED')
-            self.inc_count('request')
-            self.inc_count('request-cache')
+                    grab.log_request('CACHED')
+                    self.stat.inc('spider:request-cache')
 
-            return {'ok': True, 'grab': grab,
-                   'grab_config_backup': grab_config_backup,
-                   'task': task, 'emsg': None}
+                    return {'ok': True, 'grab': grab,
+                            'grab_config_backup': grab_config_backup,
+                            'task': task, 'emsg': None}
 
-    def valid_response_code(self, code, task):
+    def is_valid_network_response_code(self, code, task):
         """
         Answer the question: if the response could be handled via
         usual task handler or the task faield and should be processed as error.
@@ -575,31 +656,33 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
         return (code < 400 or code == 404 or
                 code in task.valid_status)
 
-    def process_handler_error(self, func_name, ex, task, error_tb=None):
-        self.inc_count('error-%s' % ex.__class__.__name__.lower())
+    def process_handler_error(self, func_name, ex, task):
+        self.stat.inc('spider:error-%s' % ex.__class__.__name__.lower())
 
-        if error_tb is not None:
+        if hasattr(ex, 'tb'):
             logger.error('Error in %s function' % func_name)
-            logger.error(error_tb)
+            logger.error(ex.tb)
         else:
-            logger.error('Error in %s function' % func_name,
-                          exc_info=ex)
+            logger.error('Error in %s function' % func_name, exc_info=ex)
 
         # Looks strange but I really have some problems with
         # serializing exception into string
         try:
-            ex_str = unicode(ex)
+            ex_str = six.text_type(ex)
         except TypeError:
             try:
-                ex_str = unicode(ex, 'utf-8', 'ignore')
+                ex_str = ex.decode('utf-8', 'ignore')
             except TypeError:
                 ex_str = str(ex)
 
         task_url = task.url if task is not None else None
-        self.add_item('fatal', '%s|%s|%s|%s' % (
+        self.stat.collect('fatal', '%s|%s|%s|%s' % (
             func_name, ex.__class__.__name__, ex_str, task_url))
         if isinstance(ex, FatalError):
-            raise
+            #raise FatalError()
+            #six.reraise(FatalError, ex)
+            #logger.error(ex.tb)
+            raise ex
 
     def find_data_handler(self, data):
         try:
@@ -613,56 +696,98 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
             else:
                 return handler
 
-    def execute_task_handler(self, res, handler):
-        """
-        Apply `handler` function to the network result.
+    def is_valid_network_result(self, res):
+        if res['task'].get('raw'):
+            return True
+        if res['ok']:
+            res_code = res['grab'].response.code
+            if self.is_valid_network_response_code(res_code, res['task']):
+                return True
+        return False
 
-        If network result is failed then submit task again
-        to the network task queue.
+    def run_parser(self):
         """
-
+        Main work cycle of spider process working in parser-mode.
+        """
+        # Use Stat instance that does not print any logging messages
+        if self.parser_mode:
+            self.stat = Stat(logging_period=None)
+        self.prepare_parser()
+        process_request_count = 0
         try:
-            handler_name = handler.__name__
-        except AttributeError:
-            handler_name = 'NONE'
+            recent_task_time = time.time()
+            while True:
+                try:
+                    result = self.network_result_queue.get(True, 0.1)
+                except queue.Empty:
+                    logger_verbose.debug('Network result queue is empty')
+                    # Set `waiting_shutdown_event` only after 1 seconds
+                    # of waiting for tasks to avoid
+                    # race-condition issues
+                    if time.time() - recent_task_time > 1:
+                        self.waiting_shutdown_event.set()
+                    if self.shutdown_event.is_set():
+                        logger_verbose.debug('Got shutdown event')
+                        return
+                else:
+                    process_request_count += 1
+                    recent_task_time = time.time()
+                    if self.parser_mode:
+                        self.stat.reset()
+                    if self.waiting_shutdown_event.is_set():
+                        self.waiting_shutdown_event.clear()
+                    try:
+                        handler = self.find_task_handler(result['task'])
+                    except NoTaskHandler as ex:
+                        ex.tb = format_exc()
+                        self.parser_result_queue.put((ex, result['task']))
+                        self.stat.inc('parser:handler-not-found')
+                    else:
+                        self.process_network_result_with_handler_mp(
+                            result, handler)
+                        self.stat.inc('parser:handler-processed')
+                    finally:
+                        if self.parser_mode:
+                            data = {
+                                'type': 'stat',
+                                'counters': self.stat.counters,
+                                'collections': self.stat.collections,
+                            }
+                            self.parser_result_queue.put((data, result['task']))
+                        if self.parser_mode:
+                            if self.parser_requests_per_process:
+                                if process_request_count >= self.parser_requests_per_process:
+                                    break
+        except Exception as ex:
+            logging.error('', exc_info=ex)
+            raise
+        finally:
+            self.waiting_shutdown_event.set()
 
-        if (res['task'].get('raw') or (
-            res['ok'] and self.valid_response_code(res['grab'].response.code,
-                                                   res['task']))):
-            try:
-                with self.save_timer('response_handler'):
-                    with self.save_timer('response_handler.%s' % handler_name):
-                        result = handler(res['grab'], res['task'])
-                        if result is None:
-                            pass
-                        else:
-                            for item in result:
-                                self.process_handler_result(item, res['task'])
-            except NoDataHandler as ex:
-                raise
-            except Exception as ex:
-                self.process_handler_error(handler_name, ex, res['task'])
-            else:
-                self.inc_count('task-%s-ok' % res['task'].name)
-        else:
-            # Log the error
-            if res['ok']:
-                msg = res['emsg'] = 'HTTP %s' % res['grab'].response.code
-            else:
-                msg = res['emsg']
 
-            self.inc_count('network-error-%s' % make_str(res['emsg'][:20], errors='ignore'))
-            logger.error(u'Network error: %s' % make_unicode(msg, errors='ignore'))
+    def process_network_result_with_handler_mp(self, result, handler):
+        """
+        This is like `process_network_result_with_handler` but
+        for multiprocessing version
+        """
+        handler_name = getattr(handler, '__name__', 'NONE')
+        try:
+            with self.timer.log_time('response_handler'):
+                with self.timer.log_time('response_handler.%s' % handler_name):
+                    handler_result = handler(result['grab'], result['task'])
+                    if handler_result is None:
+                        pass
+                    else:
+                        for something in handler_result:
+                            self.parser_result_queue.put((something,
+                                                          result['task']))
+        except NoDataHandler as ex:
+            ex.tb = format_exc()
+            self.parser_result_queue.put((ex, result['task']))
+        except Exception as ex:
+            ex.tb = format_exc()
+            self.parser_result_queue.put((ex, result['task']))
 
-            # Try to repeat the same network query
-            if self.network_try_limit > 0:
-                task = res['task']
-                task.refresh_cache = True
-                # Should use task.grab_config or backup of grab_config
-                task.setup_grab_config(res['grab_config_backup'])
-                self.add_task(task)
-            # TODO: allow to write error handlers
-    
     def find_task_handler(self, task):
         if task.origin_task_generator is not None:
             return self.handler_for_inline_task
@@ -717,124 +842,64 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
                 else:
                     return
 
-    def process_network_result(self, res, from_cache=False):
-        """
-        Handle result received from network transport of
-        from the cache layer.
-
-        Find handler function for that task and call it.
-        """
-
+    def log_network_result_stats(self, res, from_cache=False):
         # Increase stat counters
-        self.inc_count('request-processed')
-        self.inc_count('task')
-        self.inc_count('task-%s' % res['task'].name)
+        self.stat.inc('spider:request-processed')
+        self.stat.inc('spider:task')
+        self.stat.inc('spider:task-%s' % res['task'].name)
         if (res['task'].network_try_count == 1 and
-            res['task'].task_try_count == 1):
-            self.inc_count('task-%s-initial' % res['task'].name)
+                res['task'].task_try_count == 1):
+            self.stat.inc('spider:task-%s-initial' % res['task'].name)
 
         # Update traffic statistics
         if res['grab'] and res['grab'].response:
-            self.timers['network-name-lookup'] += res['grab'].response.name_lookup_time
-            self.timers['network-connect'] += res['grab'].response.connect_time
-            self.timers['network-total'] += res['grab'].response.total_time
-            if not from_cache:
-                self.inc_count('download-size', res['grab'].response.download_size)
-                self.inc_count('upload-size', res['grab'].response.upload_size)
-            self.inc_count('download-size-with-cache', res['grab'].response.download_size)
-            self.inc_count('upload-size-with-cache', res['grab'].response.upload_size)
-        # self.inc_count('traffic-in
-
-        # NG
-        # FIX: Understand how it should work in NG spider
-        # TOFIX: start
-        stop = False
-        for mid in self.middleware_points['response']:
-            try:
-                mid_response = mid.process_response(self, res)
-            except StopTaskProcessing:
-                logger.debug('Got StopTaskProcessing exception')
-                stop = True
-                break
+            resp = res['grab'].response
+            self.timer.inc_timer('network-name-lookup', resp.name_lookup_time)
+            self.timer.inc_timer('network-connect', resp.connect_time)
+            self.timer.inc_timer('network-total', resp.total_time)
+            if from_cache:
+                self.stat.inc('spider:download-size-with-cache',
+                              resp.download_size)
+                self.stat.inc('spider:upload-size-with-cache',
+                              resp.upload_size)
             else:
-                if isinstance(mid_response, Task):
-                    logger.debug('Got task from middleware')
-                    self.add_task(mid_response)
-                    stop = True
-                    break
-                elif mid_response is None:
-                    pass
-                else:
-                    raise Exception('Unknown response from middleware %s' % mid)
-        # TOFIX: end
+                self.stat.inc('spider:download-size', resp.download_size)
+                self.stat.inc('spider:upload-size', resp.upload_size)
 
-        if stop:
-            return
 
-        if self.ng:
-            logger_verbose.debug('Submitting result for task %s to response'
-                                 ' queue' % res['task'])
-            self.network_response_queue.put(res)
-        else:
-            handler = self.find_task_handler(res['task'])
-            self.execute_task_handler(res, handler)
+    def process_grab_proxy(self, task, grab):
+        "Assign new proxy from proxylist to the task"
+
+        if task.use_proxylist:
+            if self.proxylist_enabled:
+                # Need this to work around
+                # pycurl feature/bug: 
+                # pycurl instance uses previously connected proxy server
+                # even if `proxy` options is set with another proxy server
+                grab.setup(connection_reuse=False)
+                if self.proxy_auto_change:
+                    self.proxy = self.change_proxy(task, grab)
 
     def change_proxy(self, task, grab):
-        """
-        Assign new proxy from proxylist to the task.
-        """
+        proxy = self.proxylist.get_random_proxy()
+        grab.setup(proxy=proxy.get_address(),
+                   proxy_userpwd=proxy.get_userpwd(),
+                   proxy_type=proxy.proxy_type)
+        return proxy
 
-        if task.use_proxylist and self.proxylist_enabled:
-            if self.proxy_auto_change:
-                self.proxy = self.proxylist.get_random()
-            if self.proxy:
-                proxy, proxy_userpwd, proxy_type = self.proxy
-                grab.setup(proxy=proxy, proxy_userpwd=proxy_userpwd,
-                           proxy_type=proxy_type)
-
-    def process_new_task(self, task):
-        """
-        Handle new task.
-
-        1) Setup Grab object for that task
-        2) Try to load task from the cache
-        3) If no cached data then submit task to network transport
-        """
-
-        grab = self.setup_grab_for_task(task)
-        grab_config_backup = grab.dump_config()
-
-        cache_result = None
-        if self.is_task_cacheable(task, grab):
-            with self.save_timer('cache'):
-                with self.save_timer('cache.read'):
-                    cache_result = self.load_task_from_cache(
-                        self.transport, task, grab, grab_config_backup)
-
-        if cache_result:
-            logger_verbose.debug('Task data is loaded from the cache. '
-                                 'Yielding task result.')
-            self.process_network_result(cache_result, from_cache=True)
-            self.inc_count('task-%s-cache' % task.name)
-        else:
-            if self.only_cache:
-                logger.debug('Skipping network request to %s' % grab.config['url'])
-            else:
-                self.inc_count('request-network')
-                self.inc_count('task-%s-network' % task.name)
-                self.change_proxy(task, grab)
-                with self.save_timer('network_transport'):
-                    logger_verbose.debug('Submitting task to the transport '
-                                         'layer')
-                    try:
-                        self.transport.process_task(task, grab, grab_config_backup)
-                    except GrabInvalidUrl as ex:
-                        logger.debug('Task %s has invalid URL: %s' % (
-                            task.name, task.url))
-                        self.add_item('invalid-url', task.url)
-                    else:
-                        logger_verbose.debug('Asking transport layer to do '
-                                             'something')
+    def submit_task_to_transport(self, task, grab, grab_config_backup):
+        self.stat.inc('spider:request-network')
+        self.stat.inc('spider:task-%s-network' % task.name)
+        with self.timer.log_time('network_transport'):
+            logger_verbose.debug('Submitting task to the transport '
+                                 'layer')
+            try:
+                self.transport.start_task_processing(
+                    task, grab, grab_config_backup)
+            except GrabInvalidUrl:
+                logger.debug('Task %s has invalid URL: %s' % (
+                    task.name, task.url))
+                self.stat.collect('invalid-url', task.url)
 
     def is_valid_for_cache(self, res):
         """
@@ -844,245 +909,263 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
         res: {ok, grab, grab_config_backup, task, emsg}
         """
 
-
         if res['ok']:
             if self.cache_enabled:
                 if res['grab'].request_method == 'GET':
                     if not res['task'].get('disable_cache'):
-                        if self.valid_response_code(res['grab'].response.code,
-                                                    res['task']):
+                        if self.is_valid_network_response_code(
+                                res['grab'].response.code, res['task']):
                             return True
         return False
 
-    def stop(self):
-        """
-        This method set internal flag which signal spider
-        to stop processing new task and shuts down.
-        """
+    def start_api_thread(self):
+        from grab.spider.http_api import HttpApiThread
 
-        logger_verbose.debug('Method `stop` was called')
-        self.work_allowed = False
+        proc = HttpApiThread(self)
+        proc.start()
+        return proc
+
+    def is_ready_to_shutdown(self):
+        # Things should be true to shutdown spider
+        # 1) No active network connections
+        # 2) Network result queue is empty
+        # 3) Task queue is empty
+        # 4) Parser pipeline is ready to shutdown
+        # 5) Task generator has completed
+        return (
+            self.parser_pipeline.is_waiting_shutdown()
+            and not self.task_generator_enabled
+            and not self.transport.get_active_threads_number()
+            and not self.task_queue.size()
+            and not self.network_result_queue.qsize()
+        )
 
     def run(self):
         """
         Main method. All work is done here.
         """
+        if self.mp_mode:
+            from multiprocessing import Process, Event, Queue
+        else:
+            from multiprocessing.dummy import Process, Event, Queue
 
-        self.start_timer('total')
-
+        self.timer.start('total')
         self.transport = MulticurlTransport(self.thread_number)
 
+        if self.http_api_port:
+            http_api_proc = self.start_api_thread()
+        else:
+            http_api_proc = None
+
+        self.parser_pipeline = ParserPipeline(
+            bot=self,
+            mp_mode=self.mp_mode,
+            pool_size=self.parser_pool_size,
+            shutdown_event=self.shutdown_event,
+            network_result_queue=self.network_result_queue,
+            requests_per_process=self.parser_requests_per_process,
+        )
+        network_result_queue_limit = max(10, self.thread_number * 2)
+        
         try:
-            self.setup_default_queue()
+            # Run custom things defined by this specific spider
+            # By defaut it does nothing
             self.prepare()
 
-            self.start_timer('task_generator')
-            if not self.slave:
-                if not self.ng:
-                    self.init_task_generator()
-            self.stop_timer('task_generator')
+            # Setup task queue if it has not been configured yet
+            if self.task_queue is None:
+                self.setup_queue()
 
+            # Initiate task generator. Only in main process!
+            with self.timer.log_time('task_generator'):
+                self.start_task_generator()
 
             while self.work_allowed:
-
-                now = int(time.time())
-                if now - self.last_snapshot_values['timestamp'] > self.snapshot_interval:
-                    snapshot = {'timestamp': now}
-                    for key in ('download-size', 'upload-size',
-                                'download-size-with-cache'):
-                        snapshot[key] = self.counters[key] - self.last_snapshot_values[key]
-                        self.last_snapshot_values[key] = self.counters[key]
-
-                    snapshot['request-count'] = self.counters['request'] -\
-                        self.last_snapshot_values['request-count']
-                    self.last_snapshot_values['request-count'] = self.counters['request']
-                    self.last_snapshot_values['timestamp'] = now
-
-                    self.snapshots[now] = snapshot
-                    self.snapshot_timestamps.append(now)
-
-                    if self.snapshot_file:
-                        with open(self.snapshot_file, 'a') as out:
-                            out.write(json.dumps(snapshot) + '\n')
-
-                # FIXIT: REMOVE
-                # Run update task handler which
-                # updates database object which stores
-                # info about current scraping process
-                if self.dump_spider_stats:
-                    self.dump_spider_stats(self)
-
-                if self.controller.enabled:
-                    self.controller.process_commands()
-
-                if not self.ng:
-                    # NG
-                    self.start_timer('task_generator')
-                    # star
+                with self.timer.log_time('task_generator'):
                     if self.task_generator_enabled:
                         self.process_task_generator()
-                    self.stop_timer('task_generator')
 
+                result_from_cache = None
                 free_threads = self.transport.get_free_threads_number()
-                if free_threads:
-                    logger_verbose.debug('Transport has free resources (%d). '
-                                         'Trying to add new task (if exists).' % free_threads)
+                # Load new task only if self.network_result_queue is not full
+                if (self.transport.get_free_threads_number()
+                        and (self.network_result_queue.qsize()
+                             < network_result_queue_limit)):
+                    logger_verbose.debug(
+                        'Transport and parser have free resources. '
+                        'Trying to load new task from task queue.')
 
-                    # Try five times to get new task and proces task generator
-                    # because slave parser could agressively consume
-                    # tasks from task queue
-                    for x in xrange(5):
-                        task = self.load_new_task()
-                        if task is None:
-                            if not self.transport.active_task_number():
-                                self.process_task_generator()
-                        elif task is True:
-                            # If only delayed tasks in queue
-                            break
-                        else:
-                            # If got some task
-                            break
+                    task = self.get_task_from_queue()
 
-                    if not task:
-                        if not self.transport.active_task_number():
-                            logger_verbose.debug('Network transport has no '
-                                                 'active tasks')
-                            # NG
-                            if self.ng:
-                                self.waiting_shutdown_event.set()
-                                if self.shutdown_event.is_set():
-                                    logger_verbose.debug('Got shutdown signal')
-                                    self.stop()
-                                else:
-                                    logger_verbose.debug('Shutdown event has'
-                                                         ' not been set yet')
-                            else:
-                                if not self.task_generator_enabled:
-                                    self.stop()
-                        else:
-                            logger_verbose.debug('Transport active tasks: %d' %
-                                                 self.transport.active_task_number())
-                    elif isinstance(task, NullTask):
-                        logger_verbose.debug('Got NullTask')
-                        if not self.transport.active_task_number():
-                            if task.sleep:
-                                logger.debug('Got NullTask with sleep '
-                                             'instruction. Sleeping for'
-                                             ' %.2f seconds' % task.sleep)
-                                time.sleep(task.sleep)
+                    # If no task received from task queue
+                    # try to query task generator
+                    # and then check if spider could be shuted down
+                    if task is None:
+                        if not self.transport.get_active_threads_number():
+                            self.process_task_generator()
+
+                    if task is None:
+                        # If no task received from task queue
+                        # check if spider could be shut down
+                        if self.is_ready_to_shutdown():
+                            self.shutdown_event.set()
+                            self.stop()
+                            break # Break `if self.work_allowed` cycle
                     elif isinstance(task, bool) and (task is True):
                         # Take some sleep to not load CPU
-                        if not self.transport.active_task_number():
+                        if not self.transport.get_active_threads_number():
                             time.sleep(0.1)
                     else:
-                        if self.ng:
-                            if self.waiting_shutdown_event.is_set():
-                                self.waiting_shutdown_event.clear()
                         logger_verbose.debug('Got new task from task queue: %s'
                                              % task)
-                        self.process_task_counters(task)
-
+                        task.network_try_count += 1
                         is_valid, reason = self.check_task_limits(task)
-                        if not is_valid:
-                            logger_verbose.debug('Task %s is rejected due to '
-                                                 '%s limit'
-                                                 % (task.name, reason))
-                            if reason == 'task-try-count':
-                                self.add_item('task-count-rejected', task.url)
-                            elif reason == 'network-try-count':
-                                self.add_item('network-count-rejected', task.url)
+                        if is_valid:
+                            grab = self.setup_grab_for_task(task)
+                            grab_config_backup = grab.dump_config()
+
+                            result_from_cache = None
+                            if self.is_task_cacheable(task, grab):
+                                result_from_cache = self.load_task_from_cache(
+                                    task, grab, grab_config_backup)
+
+                            if result_from_cache:
+                                logger_verbose.debug(
+                                    'Task data is loaded from the cache. ')
                             else:
-                                raise Exception('Unknown response from '
-                                                'check_task_limits: %s'
-                                                % reason)
+                                if self.only_cache:
+                                    logger.debug('Skipping network request to '
+                                                 '%s' % grab.config['url'])
+                                else:
+                                    self.process_grab_proxy(task, grab)
+                                    self.submit_task_to_transport(
+                                        task, grab, grab_config_backup)
+                        else:
+                            self.log_rejected_task(task, reason)
                             handler = task.get_fallback_handler(self)
                             if handler:
                                 handler(task)
-                            # TODO: not do following line
-                            # TODO: middleware: TaskFails
-                        else:
-                            self.process_new_task(task)
-                            self.transport.process_handlers()
 
-                with self.save_timer('network_transport'):
+                with self.timer.log_time('network_transport'):
                     logger_verbose.debug('Asking transport layer to do '
                                          'something')
                     self.transport.process_handlers()
 
                 logger_verbose.debug('Processing network results (if any).')
-                # Iterate over network trasport ready results
+
+                # Collect completed network results
                 # Each result could be valid or failed
-                # Result format: {ok, grab, grab_config_backup, task, emsg}
-                
-                # print '[transport iterate results - start]'
-                for result in self.transport.iterate_results():
-                    if self.is_valid_for_cache(result):
-                        with self.save_timer('cache'):
-                            with self.save_timer('cache.write'):
-                                self.cache.save_response(result['task'].url,
-                                                         result['grab'])
+                # Result is dict {ok, grab, grab_config_backup, task, emsg}
+                results = [(x, False) for x in
+                           self.transport.iterate_results()]
+                if result_from_cache:
+                    results.append((result_from_cache, True))
 
-                    # print '[process network results]'
-                    self.process_network_result(result)
-                    # print '[done]'
-                    self.inc_count('request')
+                # Some sleep to avoid thousands of iterations per second.
+                # If no results from network transport
+                if not results:
+                    # If task queue is empty (or if there are only
+                    # delayed tasks)
+                    if task is None or bool(task) == True:
+                        # If no network activity
+                        if not self.transport.get_active_threads_number():
+                            # If parser result queue is empty
+                            if not self.parser_pipeline.has_results():
+                                # Just sleep some time, do not kill CPU
+                                time.sleep(0.1)
 
-                # print '[transport iterate results - end]'
+                for result, from_cache in results:
+                    if not from_cache:
+                        if self.is_valid_for_cache(result):
+                            with self.timer.log_time('cache'):
+                                with self.timer.log_time('cache.write'):
+                                    self.cache.save_response(
+                                        result['task'].url, result['grab'])
+                    self.log_network_result_stats(
+                        result, from_cache=from_cache)
+                    if self.is_valid_network_result(result):
+                        #handler = self.find_task_handler(result['task'])
+                        #self.process_network_result_with_handler(
+                        #    result, handler)
+                        # MP:
+                        # ***
+                        self.network_result_queue.put(result)
+                    else:
+                        self.log_failed_network_result(result)
+                        # Try to do network request one more time
+                        if self.network_try_limit > 0:
+                            result['task'].refresh_cache = True
+                            result['task'].setup_grab_config(
+                                result['grab_config_backup'])
+                            self.add_task(result['task'])
+                    if from_cache:
+                        self.stat.inc('spider:task-%s-cache' % task.name)
+                    self.stat.inc('spider:request')
+
+                # MP:
+                # ***
+                while True:
+                    try:
+                        p_res, p_task = self.parser_pipeline.get_result()
+                    except queue.Empty:
+                        break
+                    else:
+                        self.stat.inc('spider:parser-result')
+                        self.process_handler_result(p_res, p_task)
+
+                if not self.shutdown_event.is_set():
+                    self.parser_pipeline.check_pool_health()
 
             logger_verbose.debug('Work done')
         except KeyboardInterrupt:
-            print('\nGot ^C signal. Stopping.')
+            logger.info('\nGot ^C signal in process %d. Stopping.'
+                        % os.getpid())
             self.interrupted = True
             raise
         finally:
             # This code is executed when main cycles is breaked
-            self.stop_timer('total')
+            self.timer.stop('total')
+            self.stat.print_progress_line()
             self.shutdown()
 
-    def load_proxylist(self, source, source_type, proxy_type='http',
-                       auto_init=True, auto_change=True,
-                       **kwargs):
-        self.proxylist = ProxyList(source, source_type, proxy_type=proxy_type,
-                                   **kwargs)
+            # Stop HTTP API process
+            if http_api_proc:
+                http_api_proc.server.shutdown()
+                http_api_proc.join()
 
-        self.proxylist_enabled = True
-        self.proxy = None
-        if not auto_change and auto_init:
-            self.proxy = self.proxylist.get_random()
-        self.proxy_auto_change = auto_change
+            if self.task_queue:
+                self.task_queue.clear()
 
-    def get_name(self):
-        if hasattr(self, 'spider_name'):
-            return self.spider_name
+            # Stop parser processes
+            self.shutdown_event.set()
+            self.parser_pipeline.shutdown()
+            logger.debug('Main process [pid=%s]: work done' % os.getpid())
+
+    def log_failed_network_result(self, res):
+        # Log the error
+        if res['ok']:
+            msg = 'http-%s' % res['grab'].response.code
         else:
-            return camel_case_to_underscore(self.__class__.__name__)
+            msg = res['error_abbr']
 
-    # ****************
-    # Abstract methods
-    # ****************
+        self.stat.inc('error:%s' % msg) 
+        #logger.error(u'Network error: %s' % msg)#%
+                     #make_unicode(msg, errors='ignore'))
 
-    def shutdown(self):
-        """
-        You can override this method to do some final actions
-        after parsing has been done.
-        """
-
-        logger.debug('Job done!')
-
-    def task_generator(self):
-        """
-        You can override this method to load new tasks smoothly.
-
-        It will be used each time as number of tasks
-        in task queue is less then number of threads multiplied on 2
-        This allows you to not overload all free memory if total number of
-        tasks is big.
-        """
-
-        if False:
-            # Some magic to make this function empty generator
-            yield ':-)'
-        return
+    def log_rejected_task(self, task, reason):
+        logger_verbose.debug('Task %s is rejected due to '
+                             '%s limit'
+                             % (task.name, reason))
+        if reason == 'task-try-count':
+            self.stat.collect('task-count-rejected',
+                             task.url)
+        elif reason == 'network-try-count':
+            self.stat.collect('network-count-rejected',
+                             task.url)
+        else:
+            raise SpiderError('Unknown response from '
+                              'check_task_limits: %s'
+                              % reason)
 
     def process_handler_result(self, result, task=None):
         """
@@ -1111,131 +1194,18 @@ class Spider(SpiderMetaClassMixin, SpiderPattern, SpiderStat):
                                            task)
         elif result is None:
             pass
+        elif isinstance(result, Exception): 
+            handler = self.find_task_handler(task)
+            handler_name = getattr(handler, '__name__', 'NONE')
+            self.process_handler_error(handler_name, result, task)
+        elif isinstance(result, dict):
+            if result.get('type') == 'stat':
+                for name, count in result['counters'].items():
+                    self.stat.inc(name, count)
+                for name, items in result['collections'].items():
+                    for item in items:
+                        self.stat.collect(name, item)
+            else:
+                raise SpiderError('Unknown result type: %s' % result)
         else:
             raise SpiderError('Unknown result type: %s' % result)
-        
-    @classmethod
-    def get_spider_name(cls):
-        if hasattr(cls, 'spider_name'):
-            return cls.spider_name
-        else:
-            return camel_case_to_underscore(cls.__name__)
-
-    @classmethod
-    def setup_spider_config(cls, config):
-        pass
-
-    # ***********
-    # NG Features
-    # ***********
-
-    def run_generator(self):
-        """
-        Generate tasks and put them into Task Queue.
-
-        This is main method for Generator Process
-        """
-
-        self.init_task_generator()
-
-        while True:
-            if not self.task_generator_enabled:
-                self.generator_done_event.set()
-            if self.shutdown_event.is_set():
-                logger.info('Got shutdown event')
-                break
-            time.sleep(1)
-            self.process_task_generator()
-
-    def run_parser(self):
-        """
-        Process items received from Network Response Queue.
-
-        Network Response Queue are filled by Downloader Process.
-
-        This is main method for Parser Process.
-        """
-        should_work = True
-        while should_work:
-            try:
-                response = self.network_response_queue.get(True, 0.1)
-            except queue.Empty:
-                logger_verbose.debug('Response queue is empty.')
-                response = None
-
-            if not response:
-                self.waiting_shutdown_event.set()
-                if self.shutdown_event.is_set():
-                    logger_verbose.debug('Got shutdown signal')
-                    should_work = False
-                else:
-                    logger_verbose.debug('Shutdown event has not been set yet')
-            else:
-                if self.waiting_shutdown_event.is_set():
-                    self.waiting_shutdown_event.clear()
-                logger_verbose.debug('Got new response from response '
-                                     'queue: %s' % response['task'].url)
-
-                handler = self.find_task_handler(response['task'])
-                self.execute_task_handler(response, handler)
-
-        logger_verbose.debug('Work done')
-
-    """
-    TODO:
-    Develop Manager Process which contains logic of accepting or rejecting
-    task objects received from Parser Processes
-    Maybe Manager Process also should controls the Data flow
-    TODO2:
-    Data handler process
-    def run_manager(self):
-        try:
-            self.start_time = time.time()
-            self.prepare()
-            res_count = 0
-
-            while True:
-                try:
-                    res = self.result_queue.get(block=True, timeout=2)
-                except Queue.Empty:
-                    #pass
-                    res = None
-
-                if res is None:
-                    logging.error('res is None: stopping')
-                    break
-
-                if self.should_stop:
-                    break
-
-                if self.task_generator_enabled:
-                    self.process_task_generator()
-
-                for task, original_task in res['task_list']:
-                    logging.debug('Processing task items from result queue')
-                    self.process_handler_result(task)
-
-                #for data, original_task in res['data_list']:
-                    #logging.debug('Processing data items from result queue')
-                    #self.process_handler_result(data)
-
-        except KeyboardInterrupt:
-            print '\nGot ^C signal. Stopping.'
-            print self.render_stats()
-            raise
-        finally:
-            This code is executed when main cycles is breaked
-            self.shutdown()
-    """
-                
-    def command_get_stats(self, command):
-        return {'data': self.render_stats()}
-
-    @classmethod
-    def get_available_command_names(cls):
-        spider = cls()
-        clist = []
-        for key in dir(spider):
-            if key.startswith('command_'):
-                clist.append(key.split('command_', 1)[1])
-        return sorted(clist)

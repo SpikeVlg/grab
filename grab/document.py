@@ -8,38 +8,33 @@ from __future__ import absolute_import
 import weakref
 import re
 from copy import copy
-import logging
 import email
 import os
 import json
-try:
-    from urlparse import urlsplit, parse_qs
-except ImportError:
-    from urllib.parse import urlsplit, parse_qs
 import tempfile
 import webbrowser
 import codecs
 from datetime import datetime
 import time
-try:
-    from urlparse import urljoin
-except ImportError:
-    from urllib.parse import urljoin
 from selection import XpathSelector
+import six
+from six.moves.urllib.parse import urlsplit, parse_qs, urljoin
+import threading
+from six import BytesIO, StringIO
+from weblib.http import smart_urlencode
+import weblib.encoding
+from weblib.files import hashed_path
+from weblib.structured import TreeInterface
+from weblib.text import normalize_space
+from weblib.html import decode_entities, find_refresh_url
+from weblib.rex import normalize_regexp
+import logging
 
-import tools.encoding
 from grab.cookie import CookieManager
-from tools.files import hashed_path
-from tools.structured import TreeInterface
-from tools.text import normalize_space
-from tools.html import decode_entities
 from grab.error import GrabMisuseError, DataNotFound
-from tools.rex import normalize_regexp
 from grab.const import NULL
-from grab.util.py3k_support import * # noqa
-from tools.http import smart_urlencode
+from grab.util.warning import warn
 
-logger = logging.getLogger('grab.response')
 NULL_BYTE = chr(0)
 RE_XML_DECLARATION = re.compile(br'^[^<]{,100}<\?xml[^>]+\?>', re.I)
 RE_DECLARATION_ENCODING = re.compile(br'encoding\s*=\s*["\']([^"\']+)["\']')
@@ -58,10 +53,12 @@ _BOM_TABLE = [
     (codecs.BOM_UTF8, 'utf-8')
 ]
 _FIRST_CHARS = set(char[0] for (char, name) in _BOM_TABLE)
+THREAD_STORAGE = threading.local()
+logger = logging.getLogger('grab.document')
 
 
 def read_bom(data):
-    """Read the byte order mark in the text, if present, and 
+    """Read the byte order mark in the text, if present, and
     return the encoding represented by the BOM and the BOM.
 
     If no BOM can be detected, (None, None) is returned.
@@ -86,20 +83,20 @@ class TextExtension(object):
             unicode string, and search will be performed in
             `response.unicode_body()` else `anchor` should be the byte-string
             and search will be performed in `response.body`
-        
+
         If substring is found return True else False.
         """
 
-        if isinstance(anchor, unicode):
+        if isinstance(anchor, six.text_type):
             if byte:
                 raise GrabMisuseError('The anchor should be bytes string in '
                                       'byte mode')
             else:
                 return anchor in self.unicode_body()
 
-        if not isinstance(anchor, unicode):
+        if not isinstance(anchor, six.text_type):
             if byte:
-                # if PY3K:
+                # if six.PY3:
                     # return anchor in self.body_as_bytes()
                 return anchor in self.body
             else:
@@ -111,7 +108,7 @@ class TextExtension(object):
         If `anchor` is not found then raise `DataNotFound` exception.
         """
 
-        if not self.text_search(anchor, byte=byte): 
+        if not self.text_search(anchor, byte=byte):
             raise DataNotFound(u'Substring not found: %s' % anchor)
 
     def text_assert_any(self, anchors, byte=False):
@@ -121,7 +118,7 @@ class TextExtension(object):
 
         found = False
         for anchor in anchors:
-            if self.text_search(anchor, byte=byte): 
+            if self.text_search(anchor, byte=byte):
                 found = True
                 break
         if not found:
@@ -168,21 +165,20 @@ class RegexpExtension(object):
         regexp = normalize_regexp(regexp, flags)
         match = None
         if byte:
-            if not isinstance(regexp.pattern, unicode) or not PY3K:
-                # if PY3K:
+            if not isinstance(regexp.pattern, six.text_type) or not six.PY3:
+                # if six.PY3:
                     # body = self.body_as_bytes()
                 # else:
                     # body = self.body
                 match = regexp.search(self.body)
         else:
-            if isinstance(regexp.pattern, unicode) or not PY3K:
+            if isinstance(regexp.pattern, six.text_type) or not six.PY3:
                 ubody = self.unicode_body()
                 match = regexp.search(ubody)
         if match:
             return match
         else:
             if default is NULL:
-                rstr = regexp#regexp.source if regexp.hasattr('source') else regexp
                 raise DataNotFound('Could not find regexp: %s' % regexp)
             else:
                 return default
@@ -193,26 +189,6 @@ class RegexpExtension(object):
         """
 
         self.rex_search(rex, byte=byte)
-
-
-class DjangoExtension(object):
-    def django_file(self, name=None):
-        """
-        Convert content of response into django `ContentFile` object.
-
-        :param name: specify name of file, otherwise the last segment in
-        URL path will be used as filename.
-        """
-       
-        from django.core.files.base import ContentFile
-
-        if not name:
-            path = urlsplit(self.url).path
-            name = path.rstrip('/').split('/')[-1]
-
-        content_file = ContentFile(self.body)
-        content_file.name = name
-        return content_file
 
 
 class PyqueryExtension(object):
@@ -239,31 +215,24 @@ class BodyExtension(object):
         if self.body_path:
             with open(self.body_path, 'rb') as inp:
                 body_chunk = inp.read(4096)
-        elif self._cached_body:
-            body_chunk = self._cached_body[:4096]
+        elif self._bytes_body:
+            body_chunk = self._bytes_body[:4096]
         return body_chunk
 
-    def convert_body_to_unicode(self, body, bom, charset, ignore_errors, fix_special_entities):
+    def convert_body_to_unicode(self, body, bom, charset,
+                                ignore_errors, fix_special_entities):
         # How could it be unicode???
         # if isinstance(body, unicode):
             # body = body.encode('utf-8')
         if bom:
             body = body[len(self.bom):]
         if fix_special_entities:
-            body = tools.encoding.fix_special_entities(body)
+            body = weblib.encoding.fix_special_entities(body)
         if ignore_errors:
             errors = 'ignore'
         else:
             errors = 'strict'
         return body.decode(charset, errors).strip()
-
-    def _check_cached_body(self):
-        """
-        WTF???
-        """
-        if not self._cached_body:
-            if self.body_path:
-                self._cached_body = self.read_body_from_file()
 
     def read_body_from_file(self):
         with open(self.body_path, 'rb') as inp:
@@ -274,10 +243,9 @@ class BodyExtension(object):
         Return response body as unicode string.
         """
 
-        # self._check_cached_body()
         if not self._unicode_body:
             self._unicode_body = self.convert_body_to_unicode(
-                body=self.body,#_cached_body,
+                body=self.body,
                 bom=self.bom,
                 charset=self.charset,
                 ignore_errors=ignore_errors,
@@ -286,23 +254,20 @@ class BodyExtension(object):
         return self._unicode_body
 
     def _read_body(self):
-        # py3 hack
-        # if PY3K:
-            # return self.unicode_body()
-
-        # self._check_cached_body()
         if self.body_path:
             return self.read_body_from_file()
         else:
-            return self._cached_body
+            return self._bytes_body
 
     def _write_body(self, body):
-        if self.body_path:
+        if isinstance(body, six.text_type):
+            raise GrabMisuseError('Document.body could be only byte string.')
+        elif self.body_path:
             with open(self.body_path, 'wb') as out:
                 out.write(body)
-            self._cached_body = None
+            self._bytes_body = None
         else:
-            self._cached_body = body
+            self._bytes_body = body
         self._unicode_body = None
 
     body = property(_read_body, _write_body)
@@ -322,22 +287,39 @@ class DomTreeExtension(object):
         else:
             return self.build_html_tree()
 
+    def _build_dom(self, content, mode):
+        from lxml.html import HTMLParser
+        from lxml.etree import XMLParser, parse
+
+        assert mode in ('html', 'xml')
+        if mode == 'html':
+            if not hasattr(THREAD_STORAGE, 'html_parser'):
+                THREAD_STORAGE.html_parser = HTMLParser()
+            dom = parse(StringIO(content),
+                        parser=THREAD_STORAGE.html_parser)
+            return dom.getroot()
+        else:
+            if not hasattr(THREAD_STORAGE, 'xml_parser'):
+                THREAD_STORAGE.xml_parser = XMLParser()
+            dom = parse(BytesIO(content),
+                        parser=THREAD_STORAGE.xml_parser)
+            return dom.getroot()
+
+
     def build_html_tree(self):
-        from lxml.html import fromstring
         from lxml.etree import ParserError
 
         from grab.base import GLOBAL_STATE
 
         if self._lxml_tree is None:
-            # body = self.unicode_runtime_body(
-            body = self.unicode_body(
-                fix_special_entities=self.grab.config['fix_special_entities']).strip()
+            fix_setting = self.grab.config['fix_special_entities']
+            body = self.unicode_body(fix_special_entities=fix_setting).strip()
             if self.grab.config['lowercased_tree']:
                 body = body.lower()
             if self.grab.config['strip_null_bytes']:
                 body = body.replace(NULL_BYTE, '')
             # py3 hack
-            if PY3K:
+            if six.PY3:
                 body = RE_UNICODE_XML_DECLARATION.sub('', body)
             else:
                 body = RE_XML_DECLARATION.sub('', body)
@@ -347,25 +329,23 @@ class DomTreeExtension(object):
                 body = '<html></html>'
             start = time.time()
 
-            # body = simplify_html(body)
             try:
-                self._lxml_tree = fromstring(body)
+                self._lxml_tree = self._build_dom(body, 'html')
             except Exception as ex:
                 if (isinstance(ex, ParserError)
-                    and 'Document is empty' in str(ex)
-                    and not '<html' in body):
-
+                        and 'Document is empty' in str(ex)
+                        and '<html' not in body):
                     # Fix for "just a string" body
                     body = '<html>%s</html>'.format(body)
-                    self._lxml_tree = fromstring(body)
+                    self._lxml_tree = self._build_dom(body, 'html')
 
                 elif (isinstance(ex, TypeError)
                       and "object of type 'NoneType' has no len" in str(ex)
-                      and not '<html' in body):
+                      and '<html' not in body):
 
                     # Fix for smth like "<frameset></frameset>"
                     body = '<html>%s</html>'.format(body)
-                    self._lxml_tree = fromstring(body)
+                    self._lxml_tree = self._build_dom(body, 'html')
                 else:
                     raise
 
@@ -377,23 +357,15 @@ class DomTreeExtension(object):
         """
         Return DOM-tree of the document built with XML DOM builder.
         """
-    
-        logger.debug('This method is deprecated. Please use `tree` property '\
-                     'and content_type="xml" option instead.')
+        warn('Attribute `grab.xml_tree` is deprecated. '
+             'Use `Grab.doc.tree` attribute '
+             'AND content_type="xml" option instead.')
         return self.build_xml_tree()
 
     def build_xml_tree(self):
-        from lxml.etree import fromstring
-
         if self._strict_lxml_tree is None:
-            # py3 hack
-            # if PY3K:
-                # body = self.body_as_bytes(encode=True)
-            # else:
-                # body = self.body
-            self._strict_lxml_tree = fromstring(self.body)
+            self._strict_lxml_tree = self._build_dom(self.body, 'xml')
         return self._strict_lxml_tree
-
 
 
 class FormExtension(object):
@@ -402,13 +374,14 @@ class FormExtension(object):
     def choose_form(self, number=None, id=None, name=None, xpath=None):
         """
         Set the default form.
-        
+
         :param number: number of form (starting from zero)
         :param id: value of "id" attribute
         :param name: value of "name" attribute
         :param xpath: XPath query
         :raises: :class:`DataNotFound` if form not found
-        :raises: :class:`GrabMisuseError` if method is called without parameters
+        :raises: :class:`GrabMisuseError`
+            if method is called without parameters
 
         Selected form will be available via `form` attribute of `Grab`
         instance. All form methods will work with default form.
@@ -435,7 +408,8 @@ class FormExtension(object):
                 raise DataNotFound("There is no form with id: %s" % id)
         elif name is not None:
             try:
-                self._lxml_form = self.select('//form[@name="%s"]' % name).node()
+                self._lxml_form = self.select(
+                    '//form[@name="%s"]' % name).node()
             except IndexError:
                 raise DataNotFound('There is no form with name: %s' % name)
         elif number is not None:
@@ -445,13 +419,14 @@ class FormExtension(object):
                 raise DataNotFound('There is no form with number: %s' % number)
         elif xpath is not None:
             try:
-                self._lxml_form = self.select.select(xpath).node()
+                self._lxml_form = self.select(xpath).node()
             except IndexError:
-                raise DataNotFound('Could not find form with xpath: %s' % xpath)
+                raise DataNotFound(
+                    'Could not find form with xpath: %s' % xpath)
         else:
             raise GrabMisuseError('choose_form methods requires one of '
                                   '[number, id, name, xpath] arguments')
-                
+
     @property
     def form(self):
         """
@@ -509,14 +484,16 @@ class FormExtension(object):
             if isinstance(value, bool):
                 elem.checked = value
                 processed = True
-        
+
         if not processed:
             # We need to remember original values of file fields
             # Because lxml will convert UploadContent/UploadFile object to
             # string
             if getattr(elem, 'type', '').lower() == 'file':
                 self._file_fields[name] = value
-            elem.value = value
+                elem.value = ''
+            else:
+                elem.value = value
 
     def set_input_by_id(self, _id, value):
         """
@@ -529,7 +506,8 @@ class FormExtension(object):
         xpath = './/*[@id="%s"]' % _id
         if self._lxml_form is None:
             self.choose_form_by_element(xpath)
-        elem = self.form.xpath(xpath)[0]
+        sel = XpathSelector(self.form)
+        elem = sel.select(xpath).node()
         return self.set_input(elem.get('name'), value)
 
     def set_input_by_number(self, number, value):
@@ -540,7 +518,8 @@ class FormExtension(object):
         :param value: value which should be set to element
         """
 
-        elem = self.form.xpath('.//input[@type="text"]')[number]
+        sel = XpathSelector(self.form)
+        elem = sel.select('.//input[@type="text"]')[number].node()
         return self.set_input(elem.get('name'), value)
 
     def set_input_by_xpath(self, xpath, value):
@@ -551,10 +530,10 @@ class FormExtension(object):
         :param value: value which should be set to element
         """
 
-        elem = self.tree.xpath(xpath)[0]
+        elem = self.select(xpath).node()
 
         if self._lxml_form is None:
-            # Explicitly set the default form 
+            # Explicitly set the default form
             # which contains found element
             parent = elem
             while True:
@@ -602,7 +581,7 @@ class FormExtension(object):
             g.set_input('pwd', '123')
             # Submit the form
             g.submit()
-            
+
             # or we can just fill the form
             # and do manual submission
             g.set_input('foo', 'bar')
@@ -619,13 +598,12 @@ class FormExtension(object):
         # if submit element is image
 
         post = self.form_fields()
-        submit_control = None
 
         # Build list of submit buttons which have a name
         submit_controls = {}
         for elem in self.form.inputs:
             if (elem.tag == 'input' and elem.type == 'submit' and
-                elem.get('name') is not None):
+                    elem.get('name') is not None):
                 submit_controls[elem.name] = elem
 
         # All this code need only for one reason:
@@ -635,8 +613,9 @@ class FormExtension(object):
         if len(submit_controls):
             # If name of submit control is not given then
             # use the name of first submit control
-            if submit_name is None or not submit_name in submit_controls:
-                controls = sorted(submit_controls.values(), key=lambda x: x.name)
+            if submit_name is None or submit_name not in submit_controls:
+                controls = sorted(submit_controls.values(),
+                                  key=lambda x: x.name)
                 submit_name = controls[0].name
 
             # Form data should contain only one submit control
@@ -729,30 +708,32 @@ class FormExtension(object):
         return fields
 
     def choose_form_by_element(self, xpath):
-        forms = self.tree.xpath('//form')
-        found_form = None
-        for form in forms:
-            if len(form.xpath(xpath)):
-                found_form = form
-                break
-        self._lxml_form = found_form if found_form is not None else forms[0]
+        elem = self.select(xpath).node()
+        while elem is not None:
+            if elem.tag == 'form':
+                self._lxml_form = elem
+                return
+            else:
+                elem = elem.getparent()
+        self._lxml_form = None
 
 
-class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension,
+class Document(TextExtension, RegexpExtension, PyqueryExtension,
                BodyExtension, DomTreeExtension, FormExtension):
     """
-    Document (in most cases it is a network response i.e. result of network request)
+    Document (in most cases it is a network response
+        i.e. result of network request)
     """
 
-    __slots__ = ('status', 'code', 'head', '_cached_body', '_runtime_body',
+    __slots__ = ('status', 'code', 'head', '_bytes_body',
                  'body_path', 'headers', 'url', 'cookies',
-                 'charset', '_unicode_body', '_unicode_runtime_body',
+                 'charset', '_unicode_body',
                  'bom', 'timestamp',
                  'name_lookup_time', 'connect_time', 'total_time',
                  'download_size', 'upload_size', 'download_speed',
-                 'error_code', 'error_msg', 'grab',
+                 'error_code', 'error_msg', 'grab', 'remote_ip',
                  '_lxml_tree', '_strict_lxml_tree', '_pyquery',
-                 '_lxml_form', '_file_fields',
+                 '_lxml_form', '_file_fields', 'from_cache',
                  )
 
     def __init__(self, grab=None):
@@ -767,12 +748,12 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
         self.status = None
         self.code = None
         self.head = None
-        self.headers =None
+        self.headers = None
         self.url = None
         self.cookies = CookieManager()
         self.charset = 'utf-8'
         self.bom = None
-        self.timestamp = datetime.now()
+        self.timestamp = datetime.utcnow()
         self.name_lookup_time = 0
         self.connect_time = 0
         self.total_time = 0
@@ -781,13 +762,12 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
         self.download_speed = 0
         self.error_code = None
         self.error_msg = None
+        self.from_cache = False
 
         # Body
         self.body_path = None
-        self._cached_body = None
+        self._bytes_body = None
         self._unicode_body = None
-        self._runtime_body = None
-        self._unicode_runtime_body = None
 
         # DOM Tree
         self._lxml_tree = None
@@ -809,40 +789,36 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
     def structure(self, *args, **kwargs):
         return TreeInterface(self.tree).structured_xpath(*args, **kwargs)
 
-    def parse(self, charset=None):
+    def parse(self, charset=None, headers=None):
         """
-        Parse headers and cookies.
+        Parse headers.
 
         This method is called after Grab instance performes network request.
         """
 
-        # Extract only valid lines which contain ":" character
-        valid_lines = []
-        for line in self.head.split('\n'):
-            line = line.rstrip('\r')
-            if line:
-                # Each HTTP line meand the start of new response
-                # self.head could contains info about multiple responses
-                # For example, then 301/302 redirect was processed automatically
-                # Maybe it is a bug and should be fixed
-                # Anyway, we handle this issue here and save headers
-                # only from last response
-                if line.startswith('HTTP'):
-                    self.status = line
-                    valid_lines = []
-                else:
-                    if ':' in line:
-                        valid_lines.append(line)
-
-        self.headers = email.message_from_string('\n'.join(valid_lines))
+        if headers:
+            self.headers = headers
+        else:
+            # Parse headers only from last response
+            # There could be multiple responses in `self.head`
+            # in case of 301/302 redirect
+            # Separate responses
+            if self.head:
+                responses = self.head.rsplit(b'\nHTTP/', 1)
+                # Cut off the 'HTTP/*' line from the last response
+                _, response = responses[-1].split(b'\n', 1)
+                response = response.decode('ascii', 'ignore')
+            else:
+                response = ''
+            self.headers = email.message_from_string(response)
 
         if charset is None:
-            if isinstance(self.body, unicode):
+            if isinstance(self.body, six.text_type):
                 self.charset = 'utf-8'
             else:
                 self.detect_charset()
         else:
-            self.charset = charset
+            self.charset = charset.lower()
 
         self._unicode_body = None
 
@@ -882,7 +858,8 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
                 if body_chunk.startswith(b'<?xml'):
                     match = RE_XML_DECLARATION.search(body_chunk)
                     if match:
-                        enc_match = RE_DECLARATION_ENCODING.search(match.group(0))
+                        enc_match = RE_DECLARATION_ENCODING.search(
+                            match.group(0))
                         if enc_match:
                             charset = enc_match.group(1)
 
@@ -893,6 +870,7 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
                     charset = self.headers['Content-Type'][(pos + 8):]
 
         if charset:
+            charset = charset.lower()
             if not isinstance(charset, str):
                 # Convert to unicode (py2.x) or string (py3.x)
                 charset = charset.decode('utf-8')
@@ -900,7 +878,8 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
             try:
                 codecs.lookup(charset)
             except LookupError:
-                logger.error('Unknown charset found: %s' % charset)
+                logger.error('Unknown charset found: %s.'
+                             ' Using utf-8 istead.' % charset)
                 self.charset = 'utf-8'
             else:
                 self.charset = charset
@@ -911,7 +890,7 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
         """
 
         if new_grab is not None:
-            obj = self.__class__(self.grab)#Response()
+            obj = self.__class__(self.grab)  # Response()
         else:
             obj = self.__class__(new_grab)
 
@@ -940,10 +919,7 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
                 pass
 
         with open(path, 'wb') as out:
-            if isinstance(self._cached_body, unicode):
-                out.write(self._cached_body.encode('utf-8'))
-            else:
-                out.write(self._cached_body)
+            out.write(self._bytes_body)
 
     def save_hash(self, location, basedir, ext=None):
         """
@@ -972,7 +948,7 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
         returns save_to + path
         """
 
-        if isinstance(location, unicode):
+        if isinstance(location, six.text_type):
             location = location.encode('utf-8')
         rel_path = hashed_path(location, ext=ext)
         path = os.path.join(basedir, rel_path)
@@ -983,10 +959,7 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
             except OSError:
                 pass
             with open(path, 'wb') as out:
-                if isinstance(self._cached_body, unicode):
-                    out.write(self._cached_body.encode('utf-8'))
-                else:
-                    out.write(self._cached_body)
+                out.write(self._bytes_body)
         return rel_path
 
     @property
@@ -995,7 +968,7 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
         Return response body deserialized into JSON object.
         """
 
-        if PY3K:
+        if six.PY3:
             return json.loads(self.body.decode(self.charset))
         else:
             return json.loads(self.body)
@@ -1005,7 +978,7 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
         Return result of urlsplit function applied to response url.
         """
 
-        return urlsplit(self.url) 
+        return urlsplit(self.url)
 
     def query_param(self, key):
         """
@@ -1025,7 +998,8 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
 
     @property
     def time(self):
-        logger.error('Attribute Response.time is deprecated. Use Response.total_time instead.')
+        warn('Attribute `Document.time` is deprecated. '
+             'Use `Document.total_time` instead.')
         return self.total_time
 
     def __getstate__(self):
@@ -1039,15 +1013,14 @@ class Document(TextExtension, RegexpExtension, DjangoExtension, PyqueryExtension
                 if slot != '__weakref__':
                     if hasattr(self, slot):
                         state[slot] = getattr(self, slot)
-
         state['_lxml_tree'] = None
         state['_strict_lxml_tree'] = None
         state['_lxml_form'] = None
-
-        # state['doc'].grab = weakref.proxy(self)
-
         return state
 
     def __setstate__(self, state):
         for slot, value in state.items():
             setattr(self, slot, value)
+
+    def get_meta_refresh_url(self):
+        return find_refresh_url(self.unicode_body())

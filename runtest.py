@@ -6,56 +6,63 @@ from optparse import OptionParser
 import logging
 from copy import copy
 
-from test.util import prepare_test_environment, clear_test_environment, GLOBAL
-from test.server import start_server, stop_server
-from tools.watch import watch
+from test.util import GLOBAL, start_server, stop_server
+from weblib.watch import watch
 
 # **********
 # Grab Tests
 # * pycurl transport
 # * extensions
 # **********
+
+# TODO:
+# * test redirect and response.url after redirect
 GRAB_TEST_LIST = (
     # Internal API
-    'test.case.grab_api',
-    'test.case.grab_transport',
-    'test.case.response_class',
-    'test.case.grab_debug',
+    'test.grab_api',
+    'test.grab_transport',
+    'test.response_class',
+    'test.grab_debug', # TODO: fix tests excluded for urllib3
     # Response processing
-    'test.case.grab_xml_processing',
-    'test.case.grab_response_body_processing',
-    #'test.case.grab_charset',
+    'test.grab_xml_processing',
+    'test.grab_response_body_processing',
+    'test.grab_charset',
+    'test.grab_redirect',
     # Network
-    'test.case.grab_get_request',
-    'test.case.grab_post_request',
-    'test.case.grab_user_agent',
-    'test.case.grab_cookies',
+    'test.grab_get_request',
+    'test.grab_post_request',
+    'test.grab_request', # TODO: fix tests excluded for urllib3
+    'test.grab_user_agent',
+    'test.grab_cookies', # TODO: fix tests excluded for urllib3
+    'test.grab_url_processing',
     # Refactor
-    'test.case.grab_proxy',
-    'test.case.grab_upload_file',
-    'test.case.grab_limit_option',
-    'test.case.grab_charset_issue',
-    'test.case.grab_pickle',
+    'test.grab_proxy',
+    'test.grab_upload_file',
+    'test.grab_limit_option',
+    'test.grab_charset_issue',
+    'test.grab_pickle', # TODO: fix tests excluded for urllib3
     # *** Extension sub-system
-    'test.case.extension',
     # *** Extensions
-    'test.case.ext_text',
-    'test.case.ext_rex',
-    'test.case.ext_lxml',
-    #'test.case.ext_form',
-    'test.case.ext_doc',
-    'test.case.ext_structured',
-    # *** Tornado Test Server
-    'test.case.debug_server',
-    # *** Item
-    'test.case.item',
-    # pycurl tests
-    'test.case.pycurl_cookie',
-)
-
-GRAB_EXTRA_TEST_LIST = (
-    'test.case.grab_django',
-    'test.case.ext_pyquery',
+    'test.ext_text',
+    'test.ext_rex',
+    'test.ext_lxml',
+    'test.ext_form',
+    'test.ext_doc',
+    'test.ext_structured',
+    # *** Pycurl Test
+    'test.pycurl_cookie',
+    # *** util.module
+    'test.util_module',
+    'test.util_log',
+    # *** grab.export
+    'test.util_config',
+    'test.script_crawl',
+    #'test.script_start_project',
+    'test.grab_error',
+    'test.selector_deprecated',
+    'test.grab_deprecated',
+    'test.ext_pyquery',
+    'test.tools_deprecated',
 )
 
 # ************
@@ -63,43 +70,48 @@ GRAB_EXTRA_TEST_LIST = (
 # ************
 
 SPIDER_TEST_LIST = (
-    'test.case.spider',
-    #'tests.test_distributed_spider',
-    'test.case.spider_task',
-    'test.case.spider_proxy',
-    'test.case.spider_queue',
-    'test.case.spider_misc',
-    'test.case.spider_meta',
-    'test.case.spider_error',
-    'test.case.spider_cache',
-    'test.case.spider_command_controller',
+    'test.spider_task',
+    'test.spider',
+    'test.spider_proxy',
+    'test.spider_queue',
+    'test.spider_misc',
+    'test.spider_meta',
+    'test.spider_error',
+    'test.spider_cache',
+    'test.spider_data',
+    'test.spider_stat',
+    'test.spider_multiprocess',
 )
-
-SPIDER_EXTRA_TEST_LIST = ()
 
 
 def main():
     logging.basicConfig(level=logging.DEBUG)
     parser = OptionParser()
     parser.add_option('-t', '--test', help='Run only specified tests')
-    parser.add_option('--transport', help='Test specified transport',
-                      default='grab.transport.curl.CurlTransport')
-    parser.add_option('--extra', action='store_true',
-                      default=False, help='Run extra tests for specific backends')
+    parser.add_option('--transport', default='pycurl')
     parser.add_option('--test-grab', action='store_true',
                       default=False, help='Run tests for Grab::Spider')
     parser.add_option('--test-spider', action='store_true',
                       default=False, help='Run tests for Grab')
     parser.add_option('--test-all', action='store_true',
-                      default=False, help='Run tests for both Grab and Grab::Spider')
+                      default=False,
+                      help='Run tests for both Grab and Grab::Spider')
     parser.add_option('--backend-mongo', action='store_true',
-                      default=False, help='Run extra tests that depends on mongodb')
+                      default=False,
+                      help='Run extra tests that depends on mongodb')
     parser.add_option('--backend-redis', action='store_true',
-                      default=False, help='Run extra tests that depends on redis')
+                      default=False,
+                      help='Run extra tests that depends on redis')
     parser.add_option('--backend-mysql', action='store_true',
-                      default=False, help='Run extra tests that depends on mysql')
+                      default=False,
+                      help='Run extra tests that depends on mysql')
     parser.add_option('--backend-postgresql', action='store_true',
-                      default=False, help='Run extra tests that depends on postgresql')
+                      default=False,
+                      help='Run extra tests that depends on postgresql')
+    parser.add_option('--mp-mode', action='store_true', default=False,
+                      help='Enable multiprocess mode in spider tests')
+    parser.add_option('--profile', action='store_true', default=False,
+                      help='Do profiling')
     opts, args = parser.parse_args()
 
     GLOBAL['transport'] = opts.transport
@@ -116,28 +128,22 @@ def main():
     if opts.backend_postgresql:
         GLOBAL['backends'].append('postgresql')
 
-    prepare_test_environment()
     test_list = []
 
     if opts.test_all:
         test_list += GRAB_TEST_LIST
         test_list += SPIDER_TEST_LIST
-        if opts.extra:
-            test_list += GRAB_EXTRA_TEST_LIST
-            test_list += SPIDER_EXTRA_TEST_LIST
 
     if opts.test_grab:
         test_list += GRAB_TEST_LIST
-        if opts.extra:
-            test_list += GRAB_EXTRA_TEST_LIST
 
     if opts.test_spider:
         test_list += SPIDER_TEST_LIST
-        if opts.extra:
-            test_list += SPIDER_EXTRA_TEST_LIST
 
     if opts.test:
         test_list += [opts.test]
+
+    GLOBAL['mp_mode'] = opts.mp_mode
 
     # Check tests integrity
     # Ensure that all test modules are imported correctly
@@ -150,15 +156,27 @@ def main():
         mod_suite = loader.loadTestsFromName(path)
         for some_suite in mod_suite:
             for test in some_suite:
-                if not hasattr(test, '_backend') or test._backend in GLOBAL['backends']:
+                if (not hasattr(test, '_backend') or
+                        test._backend in GLOBAL['backends']):
                     suite.addTest(test)
 
     runner = unittest.TextTestRunner()
+    #start_server()
 
-    start_server()
-    result = runner.run(suite)
 
-    clear_test_environment()
+    if opts.profile:
+        import cProfile
+        import pyprof2calltree
+        import pstats
+
+        profile_tree_file = 'var/test.prof.out'
+        prof = cProfile.Profile()
+        result = prof.runcall(runner.run, suite)
+        stats = pstats.Stats(prof)
+        stats.strip_dirs()
+        pyprof2calltree.convert(stats, profile_tree_file)
+    else:
+        result = runner.run(suite)
     if result.wasSuccessful():
         sys.exit(0)
     else:

@@ -1,22 +1,50 @@
 language: python
 
-python:
-  - "2.7"
-  - "3.3"
-  - "3.4"
+python: 2.7
+
+os:
+  - linux
+  - osx
+
+matrix:
+  allow_failures:
+    - os: osx
+    - env: TOX_ENV=py27-mp
+    - env: TOX_ENV=py33-mp
+    - env: TOX_ENV=py34-mp
+    - env: TOX_ENV=py27-urllib3
+    - env: TOX_ENV=py33-urllib3
+    - env: TOX_ENV=py34-urllib3
+
+env:
+  - TOX_ENV=py27
+  - TOX_ENV=py33
+  - TOX_ENV=py34
+  - TOX_ENV=py27-mp
+  - TOX_ENV=py33-mp
+  - TOX_ENV=py34-mp
+  - TOX_ENV=py27-urllib3
+  - TOX_ENV=py33-urllib3
+  - TOX_ENV=py34-urllib3
+
+services:
+  - mongodb
+  - redis-server
 
 install:
-  - pip install coverage
-  - pip install coveralls
-  - pip install flake8
-  - pip install --use-mirrors tornado
-  - pip install -r requirements.txt --use-mirrors
   # Deal with issue on Travis builders re: multiprocessing.Queue :(
   - "sudo rm -rf /dev/shm && sudo ln -s /run/shm /dev/shm"
-  - python setup.py develop
+  - pip install tox
+
+before_script:
+  - mysql -e 'create database spider_test'
+  - psql -c 'create database spider_test' -U postgres
 
 script:
-  - coverage run --source=grab runtest.py --test-all --extra
+    # Override test settings with travis settings 
+    - cp travis_settings.py test_settings_local.py
+    # Run tests and find out the test coverage
+    - tox -e $TOX_ENV
 
 after_success:
   - coveralls

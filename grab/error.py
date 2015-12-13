@@ -6,15 +6,14 @@ Taxonomy:
 
 Exception
 |-> GrabError
-    |-> GrabNetworkError <- IOError 
+    |-> GrabNetworkError <- IOError
     |-> Grab*Error
 
 Exception
-| -> tools.error.ToolsError
+| -> weblib.error.WeblibError
      |-> DataNotFound <- IndexError
 """
-import warnings
-from tools.error import DataNotFound # noqa
+from weblib.error import DataNotFound  # noqa
 
 
 class GrabError(Exception):
@@ -51,6 +50,13 @@ class GrabConnectionError(GrabNetworkError):
     """
 
 
+class GrabCouldNotResolveHostError(GrabNetworkError):
+    """
+    URLE_COULDNT_RESOLVE_HOST (6)
+    Couldn't resolve host. The given remote host was not resolved.
+    """
+
+
 class GrabAuthError(GrabError):
     """
     Raised when remote server denies authentication credentials.
@@ -66,12 +72,6 @@ class GrabTooManyRedirectsError(GrabError):
     """
 
 
-class GrabDeprecationWarning(Warning):
-    """
-    Raised when some deprecated feature is used.
-    """
-
-
 class GrabInvalidUrl(GrabError):
     """
     Raised when Grab have no idea how to handle the URL or when
@@ -79,5 +79,5 @@ class GrabInvalidUrl(GrabError):
     """
 
 
-def warn(msg):
-    warnings.warn(msg, category=GrabDeprecationWarning, stacklevel=3)
+class GrabInternalError(GrabError):
+    pass

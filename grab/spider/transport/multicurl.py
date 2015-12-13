@@ -1,13 +1,25 @@
 import pycurl
 import select
+import six
+import logging
 
 from grab.error import GrabTooManyRedirectsError
-from grab.util.py3k_support import * # noqa
+
+ERROR_TOO_MANY_REFRESH_REDIRECTS = -2
+#ERROR_INTERNAL_GRAB_ERROR = -3
+ERROR_ABBR = {
+    ERROR_TOO_MANY_REFRESH_REDIRECTS: 'too-many-refresh-redirects',
+    #ERROR_INTERNAL_GRAB_ERROR: 'internal-grab-error',
+}
+for key in dir(pycurl):
+    if key.startswith('E_'):
+        abbr = key[2:].lower().replace('_', '-')
+        ERROR_ABBR[getattr(pycurl, key)] = abbr
 
 
 class MulticurlTransport(object):
-    def __init__(self, thread_number):
-        self.thread_number = thread_number
+    def __init__(self, socket_number):
+        self.socket_number = socket_number
         self.multi = pycurl.CurlMulti()
         self.multi.handles = []
         self.freelist = []
@@ -15,7 +27,7 @@ class MulticurlTransport(object):
         self.connection_count = {}
 
         # Create curl instances
-        for x in xrange(self.thread_number):
+        for x in six.moves.range(self.socket_number):
             curl = pycurl.Curl()
             self.connection_count[id(curl)] = 0
             self.freelist.append(curl)
@@ -27,8 +39,8 @@ class MulticurlTransport(object):
     def get_free_threads_number(self):
         return len(self.freelist)
 
-    def active_task_number(self):
-        return self.thread_number - len(self.freelist)
+    def get_active_threads_number(self):
+        return self.socket_number - len(self.freelist)
 
     def process_connection_count(self, curl):
         curl_id = id(curl)
@@ -42,7 +54,7 @@ class MulticurlTransport(object):
         else:
             return curl
 
-    def process_task(self, task, grab, grab_config_backup):
+    def start_task_processing(self, task, grab, grab_config_backup):
         curl = self.process_connection_count(self.freelist.pop())
 
         self.registry[id(curl)] = {
@@ -54,7 +66,7 @@ class MulticurlTransport(object):
         try:
             grab.prepare_request()
             grab.log_request()
-        except Exception as ex:
+        except Exception:
             # If some error occurred while processing the request arguments
             # then we should put curl object back to free list
             del self.registry[id(curl)]
@@ -67,8 +79,7 @@ class MulticurlTransport(object):
     def process_handlers(self):
         # Ok, frankly I have real bad understanding of
         # how to deal with multicurl sockets ;-)
-        # It is a sort of miracle that Grab is used by some people
-        # and they managed to get job done
+        # It is a sort of miracle that Grab actually works
         rlist, wlist, xlist = self.multi.fdset()
         if rlist or wlist or xlist:
             timeout = self.multi.timeout()
@@ -84,26 +95,33 @@ class MulticurlTransport(object):
 
     def iterate_results(self):
         while True:
+            #try:
             queued_messages, ok_list, fail_list = self.multi.info_read()
+            #except Exception as ex:
+            #    # Usually that should not happen
+            #    logging.error('', exc_info=ex)
+            #    continue
 
             results = []
             for curl in ok_list:
                 results.append((True, curl, None, None))
             for curl, ecode, emsg in fail_list:
                 # CURLE_WRITE_ERROR (23)
-                # An error occurred when writing received data to a local file, or
+                # An error occurred when writing received data
+                # to a local file, or
                 # an error was returned to libcurl from a write callback.
-                # This exception should be ignored if _callback_interrupted flag
-                # is enabled (this happens when nohead or nobody options enabeld)
+                # This exception should be ignored if _callback_interrupted
+                # flag
+                # is enabled (this happens when nohead or
+                # nobody options enabeld)
                 #
-                # Also this error is raised when curl receives KeyboardInterrupt
+                # Also this error is raised when curl receives
+                # KeyboardInterrupt
                 # while it is processing some callback function
                 # (WRITEFUNCTION, HEADERFUNCTIO, etc)
                 if ecode == 23:
                     if getattr(curl, '_callback_interrupted', None) is True:
                         curl._callback_interrupted = False
-                        ecode = None
-                        emsge = None
                         results.append((True, curl, None, None))
                     else:
                         results.append((False, curl, ecode, emsg))
@@ -116,13 +134,21 @@ class MulticurlTransport(object):
                 curl_id = id(curl)
                 task = self.registry[curl_id]['task']
                 grab = self.registry[curl_id]['grab']
-                grab_config_backup = self.registry[curl_id]['grab_config_backup']
+                grab_config_backup =\
+                    self.registry[curl_id]['grab_config_backup']
 
                 try:
                     grab.process_request_result()
                 except GrabTooManyRedirectsError:
-                    ecode = -1
+                    ecode = ERROR_TOO_MANY_REFRESH_REDIRECTS
                     emsg = 'Too many meta refresh redirects'
+                    ok = False
+                #except Exception as ex:
+                #    logging.error('', exc_info=ex)
+                #    ecode = ERROR_INTERNAL_GRAB_ERROR
+                #    emsg = 'Internal grab error'
+                #    ok = False
+
                 grab.response.error_code = ecode
                 grab.response.error_msg = emsg
 
@@ -130,10 +156,20 @@ class MulticurlTransport(object):
                 del self.registry[curl_id]
                 grab.transport.curl = None
 
-                yield {'ok': ok, 'emsg': emsg, 'grab': grab,
-                       'grab_config_backup': grab_config_backup, 'task': task}
+                if ok:
+                    error_abbr = None
+                else:
+                   error_abbr = ERROR_ABBR.get(ecode, 'unknown-%d' % ecode)
+                yield {'ok': ok,
+                       'ecode': ecode,
+                       'emsg': emsg,
+                       'error_abbr': error_abbr,
+                       'grab': grab,
+                       'grab_config_backup': grab_config_backup,
+                       'task': task}
 
                 self.multi.remove_handle(curl)
+                curl.reset()
                 self.freelist.append(curl)
 
             if not queued_messages:

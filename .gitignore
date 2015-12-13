@@ -7,12 +7,6 @@
 # setuptools
 dist/
 
-# docs
-docs/_build
-docs-redirect/_build
-docs2/build
-docs-redirect/_build
-
 # misc
 log.html
 prof
@@ -30,6 +24,7 @@ docs/libpeerconnection.log
 /.py33
 /script/
 /test.py
+/test2.py
 /many_links_prof
 /prof.compiled
 /.venv/
@@ -38,3 +33,13 @@ docs/libpeerconnection.log
 .idea/
 /.coverage
 /.env/
+/.py27/
+/.py34/
+/docs/en/build/
+/docs/ru/_build/
+/build/
+/en
+/.v4
+/settings.py
+/foo.py
+/run.ini

@@ -1,13 +1,18 @@
 from __future__ import absolute_import
+from grab.error import GrabError
 
 
 __all__ = ('SpiderError', 'SpiderMisuseError', 'FatalError',
-           'StopTaskProcessing', 'SpiderInternalError',
+           'SpiderInternalError',
            'NoTaskHandler', 'NoDataHandler')
 
 
-class SpiderError(Exception):
+class SpiderError(GrabError):
     """Base class for Spider exceptions"""
+
+
+class SpiderConfigurationError(SpiderError):
+    pass
 
 
 class SpiderMisuseError(SpiderError):
@@ -16,12 +21,6 @@ class SpiderMisuseError(SpiderError):
 
 class FatalError(SpiderError):
     """Fatal error which should stop parsing process"""
-
-
-class StopTaskProcessing(SpiderError):
-    """
-    Used in middlewares to stop task processing
-    """
 
 
 class SpiderInternalError(SpiderError):

@@ -1,24 +1,33 @@
-Grab documentation
-==================
+.. Grab documentation master file, created by
+   sphinx-quickstart on Fri Mar 27 02:27:14 2015.
+   You can adapt this file completely to your liking, but it should at least
+   contain the root `toctree` directive.
 
-Grab is a python framework for building site scrapers. The Grab library consists of two main interfaces:
+Welcome to Grab's documentation!
+================================
 
-1) Grab. The main interface to configure network requests and to handle network responses.
-2) Grab::Spider. A more complex interface to build asynchronous site scrapers. The Spider interface has many commonalities with the Scrapy interface. The main benefits of Spider are an asynchronous concurrent request engine, and an internal design that forces you to organize scraping logic in to well structured blocks.
+Grab is python framework for building web scrapers. With Grab you can build web
+scrapers of various complexity: from simple 5-line scripts to complex
+asynchronous web-site crawlers processing millions of web pages. Grab provides
+API for performing network requests and for handling received content e.g.
+interacting with DOM tree of the HTML document.
 
-When to consider using the Grab API:
+There are two main parts in Grab library:
 
-* When you want to submit a single network request and process the response
-* In most cases when you think to use urllib, urllib2, pycurl or requests libs.
+    1) The single request/response API that allows you build network request,
+    perform it and work with the received content. That API is a wrapper
+    of the pycurl and lxml libraries.
 
-When Grab::Spider will probably be useful:
+    2) The Spider API to build asynchronous web crawlers. You write class that
+    define handlers for each type of network request. Each handler could spawn
+    new network requests. Network requests are processed simultaneusly with a
+    pool of asynchronous web sockets.
 
-* When you need to extract data from a web site with multiple concurrent web workers
-* In most cases when you are thinking of using scrapy.
 
-Grab is not only a tool to build network requests and download network responses, it is also a tool to handle the data of network responses and extract information you need. Grab provides a flexible API to query parts of the DOM trees of HTML documents.
+Table of Contents
+=================
 
-See the quick start tutorials to quickly get an overview of how to use Grab and Grab::Spider.
+.. _grab_toc:
 
 Grab User Manual
 ----------------
@@ -26,67 +35,67 @@ Grab User Manual
 .. toctree::
     :maxdepth: 2
 
-    grab_quickstart
-    grab_installation
-    grab_configuration
-    grab_debugging
-    grab_options
-    grab_http_headers
-    grab_http_methods
-    grab_response_body
-    grab_redirect
-    grab_network_errors
-    grab_forms
-    grab_charset
-    grab_cookies
-    grab_proxy
-    grab_response_search
-    pycurl
-    changelog
-    grab_response
-    grab_what_is_inside
+    usage/installation
+    usage/testing
+    grab/quickstart
+    grab/request_method
+    grab/request_setup
+    grab/settings
+    grab/debugging
+    grab/request_headers
+    grab/response_body
+    grab/file_uploading
+    grab/redirect
+    grab/forms
+    grab/network_errors
+    grab/charset
+    grab/cookies
+    grab/proxy
+    grab/response_search
+    grab/pycurl
+    grab/response
+
+
+.. _spider_toc:
+
+Grab::Spider User Manual
+------------------------
+
+Grab::Spider is a framework to build well-structured asyncronous web-site
+crawlers.
+
+.. toctree::
+    :maxdepth: 2
+
+    spider/intro
+    spider/task
+    spider/task_queue
+    spider/cache
+    spider/error_handling
+
+..
+    spider/proxy - new
+    spider/stat - new (inc_count/add_item/save_list/render_stats/save_all_lists)
+
+
+.. _api_toc:
 
 API Reference
 -------------
 
 Using the API Reference you can get an overview of what modules, classes, and methods exist, what they do, what they return, and what parameters they accept.
 
-Base Grab Interface
-~~~~~~~~~~~~~~~~~~~
-
 .. toctree::
     :maxdepth: 2
 
-    api_grab_base
-    api_grab_error
-    api_grab_cookie
+    api/grab_base
+    api/grab_error
+    api/grab_cookie
 
 
-Tools Package
-~~~~~~~~~~~~~
+Indices and tables
+==================
 
-.. toctree::
-    :maxdepth: 3
-
-    api_tools_html
-    api_tools_work
-    api_tools_pwork
-    api_tools_lock
-    api_tools_logs
-    api_tools_files
-    api_tools_lxml_tools
-    api_tools_rex
-    api_tools_text
-    api_tools_http
-    api_tools_content
-    api_tools_control
-    api_tools_debug
-    api_tools_encoding
-    api_tools_feed
-    api_tools_metric
-    api_tools_parser
-    api_tools_russian
-    api_tools_progress
-    api_tools_user_agent
-    api_tools_watch
-    api_tools_system
+* :ref:`genindex`
+* :ref:`modindex`
+* :ref:`search`

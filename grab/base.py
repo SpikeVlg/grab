@@ -13,24 +13,20 @@ from copy import copy, deepcopy
 import threading
 import itertools
 import collections
-try:
-    from urlparse import urljoin
-except ImportError:
-    from urllib.parse import urljoin
+from six.moves.urllib.parse import urljoin
 import email
 from datetime import datetime
 import weakref
+import six
+from weblib.html import find_refresh_url, find_base_url
+from weblib.http import normalize_http_values
 
-from tools.html import find_refresh_url, find_base_url
 from grab.document import Document
 from grab import error
-from tools.http import normalize_http_values
 from grab.cookie import CookieManager
-from grab.proxy import ProxyList, parse_proxy_line
+from grab.proxylist import ProxyList, parse_proxy_line
 from grab.deprecated import DeprecatedThings
-
-from grab.util.py2old_support import * # noqa
-from grab.util.py3k_support import * # noqa
+from grab.util.warning import warn
 
 __all__ = ('Grab',)
 # This counter will used in enumerating network queries.
@@ -42,13 +38,15 @@ __all__ = ('Grab',)
 # creates multiple Grab instances - in case of shared counter
 # grab instances do not overwrite dump logs
 REQUEST_COUNTER = itertools.count(1)
-
 GLOBAL_STATE = {
     'dom_build_time': 0,
-    'selector_time': 0,
 }
 MUTABLE_CONFIG_KEYS = ['post', 'multipart_post', 'headers', 'cookies']
 TRANSPORT_CACHE = {}
+TRANSPORT_ALIAS = {
+    'pycurl': 'grab.transport.curl.CurlTransport',
+    'urllib3': 'grab.transport.urllib3.Urllib3Transport',
+}
 
 logger = logging.getLogger('grab.base')
 # Logger to handle network activity
@@ -133,6 +131,7 @@ def default_config():
         body_inmemory=True,
         body_storage_dir=None,
         body_storage_filename=None,
+        body_storage_create_dir=False,
         reject_file_size=None,
 
         # Content compression
@@ -144,7 +143,6 @@ def default_config():
         # Redirects
         follow_refresh=False,
         follow_location=True,
-        refresh_redirect_count=0,
         redirect_limit=10,
 
         # Authentication
@@ -188,11 +186,13 @@ def default_config():
 
 class Grab(DeprecatedThings):
 
-    __slots__ = ('request_head', 'request_log', 'request_body',
+    __slots__ = ('request_head', 'request_body',
+                 #'request_log',
                  'proxylist', 'config',
                  'transport',
                  'transport_param', 'request_method', 'request_counter',
                  '__weakref__', 'cookies',
+                 'meta',
 
                  # Dirty hack to make it possible to inherit Grab from
                  # multiple base classes with __slots__
@@ -201,7 +201,8 @@ class Grab(DeprecatedThings):
 
     # Attributes which should be processed when clone
     # of Grab instance is creating
-    clonable_attributes = ('request_head', 'request_log', 'request_body',
+    clonable_attributes = ('request_head', 'request_body',
+                           #'request_log',
                            'proxylist')
 
     # Complex config items which points to mutable objects
@@ -212,23 +213,21 @@ class Grab(DeprecatedThings):
     """
 
     def __init__(self, document_body=None,
-                 transport='grab.transport.curl.CurlTransport', **kwargs):
+                 transport='pycurl', **kwargs):
         """
         Create Grab instance
         """
 
+        self.meta = {}
         self._doc = None
         self.config = default_config()
         self.config['common_headers'] = self.common_headers()
         self.cookies = CookieManager()
         self.proxylist = ProxyList()
-
         self.setup_transport(transport)
-
         self.reset()
         if kwargs:
             self.setup(**kwargs)
-
         if document_body is not None:
             self.setup_document(document_body)
 
@@ -244,15 +243,21 @@ class Grab(DeprecatedThings):
 
     def setup_transport(self, transport_param):
         self.transport_param = transport_param
-        if isinstance(transport_param, basestring):
-            mod_path, cls_name = transport_param.rsplit('.', 1)
-            try:
-                cls = TRANSPORT_CACHE[(mod_path, cls_name)]
-            except KeyError:
-                mod = __import__(mod_path, globals(), locals(), ['foo'])
-                cls = getattr(mod, cls_name)
-                TRANSPORT_CACHE[(mod_path, cls_name)] = cls
-            self.transport = cls()
+        if isinstance(transport_param, six.string_types):
+            if transport_param in TRANSPORT_ALIAS:
+                transport_param = TRANSPORT_ALIAS[transport_param]
+            if not '.' in transport_param:
+                raise error.GrabMisuseError('Unknown transport: %s'
+                                            % transport_param)
+            else:
+                mod_path, cls_name = transport_param.rsplit('.', 1)
+                try:
+                    cls = TRANSPORT_CACHE[(mod_path, cls_name)]
+                except KeyError:
+                    mod = __import__(mod_path, globals(), locals(), ['foo'])
+                    cls = getattr(mod, cls_name)
+                    TRANSPORT_CACHE[(mod_path, cls_name)] = cls
+                self.transport = cls()
         elif isinstance(transport_param, collections.Callable):
             self.transport = transport_param()
         else:
@@ -269,9 +274,8 @@ class Grab(DeprecatedThings):
         """
 
         self.request_head = None
-        self.request_log = None
+        #self.request_log = None
         self.request_body = None
-
         self.request_method = None
         self.transport.reset()
 
@@ -343,13 +347,13 @@ class Grab(DeprecatedThings):
         """
 
         if 'hammer_mode' in kwargs:
-            logging.error('Option hammer_mode is deprecated. Grab does not '
-                          'support hammer mode anymore.')
+            warn('Option `hammer_mode` is deprecated. Grab does not '
+                 'support hammer mode anymore.')
             del kwargs['hammer_mode']
 
         if 'hammer_timeouts' in kwargs:
-            logging.error('Option hammer_timeouts is deprecated. Grab does not'
-                          ' support hammer mode anymore.')
+            warn('Option `hammer_timeouts` is deprecated. Grab does not '
+                 'support hammer mode anymore.')
             del kwargs['hammer_timeouts']
 
         for key in kwargs:
@@ -393,7 +397,7 @@ class Grab(DeprecatedThings):
         self.request_counter = next(REQUEST_COUNTER)
         if kwargs:
             self.setup(**kwargs)
-        if not self.proxylist.is_empty() and self.config['proxy_auto_change']:
+        if self.proxylist.size() and self.config['proxy_auto_change']:
             self.change_proxy()
         self.request_method = self.detect_request_method()
         self.transport.process_config(self)
@@ -435,33 +439,61 @@ class Grab(DeprecatedThings):
         Returns: ``Document`` objects.
         """
 
-        self.prepare_request(**kwargs)
-        self.log_request()
 
-        try:
-            self.transport.request()
-        except error.GrabError:
-            self.reset_temporary_options()
-            self.save_failed_dump()
-            raise
-        else:
-            # That builds `self.doc`
-            self.process_request_result()
-            return self.doc
+        self.prepare_request(**kwargs)
+        refresh_count = 0
+
+        while True:
+            self.log_request()
+
+            try:
+                self.transport.request()
+            except error.GrabError:
+                self.reset_temporary_options()
+                self.save_failed_dump()
+                raise
+            else:
+                doc = self.process_request_result()
+
+                if self.config['follow_location']:
+                    if doc.code in (301, 302, 303, 307, 308):
+                        if doc.headers.get('Location'):
+                            refresh_count += 1
+                            if refresh_count > self.config['redirect_limit']:
+                                raise error.GrabTooManyRedirectsError()
+                            else:
+                                url = doc.headers.get('Location')
+                                self.prepare_request(
+                                    url=self.make_url_absolute(url),
+                                    referer=None)
+                                continue
+
+                if self.config['follow_refresh']:
+                    refresh_url = self.doc.get_meta_refresh_url()
+                    if refresh_url is not None:
+                        refresh_count += 1
+                        if refresh_count > self.config['redirect_limit']:
+                            raise error.GrabTooManyRedirectsError()
+                        else:
+                            self.prepare_request(
+                                url=self.make_url_absolute(refresh_url),
+                                referer=None)
+                            continue
+                return doc
 
     def process_request_result(self, prepare_response_func=None):
         """
         Process result of real request performed via transport extension.
         """
 
-        now = datetime.now()
+        now = datetime.utcnow()
         # TODO: move into separate method
         if self.config['debug_post']:
             post = self.config['post'] or self.config['multipart_post']
             if isinstance(post, dict):
                 post = list(post.items())
             if post:
-                if isinstance(post, basestring):
+                if isinstance(post, six.string_types):
                     post = post[:self.config['debug_post_limit']] + '...'
                 else:
                     items = normalize_http_values(post, charset='utf-8')
@@ -481,7 +513,6 @@ class Grab(DeprecatedThings):
         # It's important to delete old POST data after request is performed.
         # If POST data is not cleared then next request will try to use them
         # again!
-        old_refresh_count = self.config['refresh_redirect_count']
         self.reset_temporary_options()
 
         if prepare_response_func:
@@ -513,27 +544,16 @@ class Grab(DeprecatedThings):
         self.copy_request_data()
 
         # Should be called after `copy_request_data`
-        self.save_dumps()
+        if self.config['log_dir']:
+            self.save_dumps()
 
-        # TODO: check max redirect count
-        if self.config['follow_refresh']:
-            url = find_refresh_url(self.doc.unicode_body())
-            if url is not None:
-                inc_count = old_refresh_count + 1
-                if inc_count > self.config['redirect_limit']:
-                    raise error.GrabTooManyRedirectsError()
-                else:
-                    return self.request(url=url,
-                                        refresh_redirect_count=inc_count)
-
-        return None
+        return self.doc
 
     def reset_temporary_options(self):
         self.config['post'] = None
         self.config['multipart_post'] = None
         self.config['method'] = None
         self.config['body_storage_filename'] = None
-        self.config['refresh_redirect_count'] = 0
 
     def save_failed_dump(self):
         """
@@ -547,17 +567,22 @@ class Grab(DeprecatedThings):
         # I put it inside try/except to not break
         # live spiders
         try:
-            self.doc = self.transport.prepare_response(self)
-            self.copy_request_data()
-            self.save_dumps()
+            if self.transport_param == 'urllib3':
+                # TODO: fix exceptions
+                pass
+            else:
+                self.doc = self.transport.prepare_response(self)
+                self.copy_request_data()
+                if self.config['log_dir']:
+                    self.save_dumps()
         except Exception as ex:
-            logging.error(unicode(ex))
+            logger.error('', exc_info=ex)
 
     def copy_request_data(self):
         # TODO: Maybe request object?
         self.request_head = self.transport.request_head
         self.request_body = self.transport.request_body
-        self.request_log = self.transport.request_log
+        #self.request_log = self.transport.request_log
 
     def setup_document(self, content, **kwargs):
         """
@@ -569,12 +594,15 @@ class Grab(DeprecatedThings):
         """
 
         self.reset()
+        if isinstance(content, six.text_type):
+            raise error.GrabMisuseError('Method `setup_document` accepts only '
+                                        'byte string in `content` argument.')
 
         # Configure Document instance
         doc = Document(grab=self)
         doc.body = content
         doc.status = ''
-        doc.head = ''
+        doc.head = b'HTTP/1.1 200 OK\r\n\r\n'
         doc.parse(charset=kwargs.get('document_charset'))
         doc.code = 200
         doc.total_time = 0
@@ -592,12 +620,26 @@ class Grab(DeprecatedThings):
         Set random proxy from proxylist.
         """
 
-        if not self.proxylist.is_empty():
+        if self.proxylist.size():
             proxy = self.proxylist.get_random_proxy()
-            self.setup(proxy=proxy.address, proxy_userpwd=proxy.userpwd,
+            self.setup(proxy=proxy.get_address(),
+                       proxy_userpwd=proxy.get_userpwd(),
                        proxy_type=proxy.proxy_type)
         else:
-            logging.debug('Proxy list is empty')
+            logger.debug('Proxy list is empty')
+
+    def use_next_proxy(self):
+        """
+        Set next proxy from proxylist.
+        """
+
+        if self.proxylist.size():
+            proxy = self.proxylist.get_next_proxy()
+            self.setup(proxy=proxy.get_address(),
+                       proxy_userpwd=proxy.get_userpwd(),
+                       proxy_type=proxy.proxy_type)
+        else:
+            logger.debug('Proxy list is empty')
 
     """
     Private methods
@@ -616,32 +658,30 @@ class Grab(DeprecatedThings):
             'Accept-Charset': 'utf-8,windows-1251;q=0.7,*;q=0.%d'
                               % randint(5, 7),
             'Keep-Alive': '300',
-            'Expect': '',
         }
 
     def save_dumps(self):
-        if self.config['log_dir']:
-            thread_name = threading.currentThread().getName().lower()
-            if thread_name == 'mainthread':
-                thread_name = ''
-            else:
-                thread_name = '-%s' % thread_name
-            file_name = os.path.join(self.config['log_dir'], '%02d%s.log' % (
-                self.request_counter, thread_name))
-            with open(file_name, 'w') as out:
-                out.write('Request headers:\n')
-                out.write(self.request_head)
-                out.write('\n')
-                out.write('Request body:\n')
-                out.write(self.request_body)
-                out.write('\n\n')
-                out.write('Response headers:\n')
-                out.write(self.doc.head)
+        thread_name = threading.currentThread().getName().lower()
+        if thread_name == 'mainthread':
+            thread_name = ''
+        else:
+            thread_name = '-%s' % thread_name
+        file_name = os.path.join(self.config['log_dir'], '%02d%s.log' % (
+            self.request_counter, thread_name))
+        with open(file_name, 'wb') as out:
+            out.write(b'Request headers:\n')
+            out.write(self.request_head)
+            out.write(b'\n')
+            out.write(b'Request body:\n')
+            out.write(self.request_body)
+            out.write(b'\n\n')
+            out.write(b'Response headers:\n')
+            out.write(self.doc.head)
 
-            file_extension = 'html'
-            file_name = os.path.join(self.config['log_dir'], '%02d%s.%s' % (
-                self.request_counter, thread_name, file_extension))
-            self.doc.save(file_name)
+        file_extension = 'html'
+        file_name = os.path.join(self.config['log_dir'], '%02d%s.%s' % (
+            self.request_counter, thread_name, file_extension))
+        self.doc.save(file_name)
 
     def make_url_absolute(self, url, resolve_base=False):
         """
@@ -732,7 +772,7 @@ class Grab(DeprecatedThings):
             headers = email.message_from_string('\n'.join(lines))
             return headers
         except Exception as ex:
-            logging.error('Could not parse request headers', exc_info=ex)
+            logger.error('Could not parse request headers', exc_info=ex)
             return {}
 
     def dump(self):
