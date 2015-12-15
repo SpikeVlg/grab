@@ -16,6 +16,9 @@ import webbrowser
 import codecs
 from datetime import datetime
 import time
+from lxml.etree import ParserError
+from lxml.html import HTMLParser
+from lxml.etree import XMLParser, parse
 from selection import XpathSelector
 import six
 from six.moves.urllib.parse import urlsplit, parse_qs, urljoin
@@ -288,8 +291,6 @@ class DomTreeExtension(object):
             return self.build_html_tree()
 
     def _build_dom(self, content, mode):
-        from lxml.html import HTMLParser
-        from lxml.etree import XMLParser, parse
 
         assert mode in ('html', 'xml')
         if mode == 'html':
@@ -307,7 +308,6 @@ class DomTreeExtension(object):
 
 
     def build_html_tree(self):
-        from lxml.etree import ParserError
 
         from grab.base import GLOBAL_STATE
 
